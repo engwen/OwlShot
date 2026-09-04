@@ -1,9 +1,0 @@
-[Desktop Entry]
-Name=OwlShot
-Comment=Wayland 原生截图工具
-Exec=/usr/bin/owlshot
-Icon=owlshot
-Terminal=false
-Type=Application
-Categories=Utility;Graphics;
-Keywords=screenshot;capture;

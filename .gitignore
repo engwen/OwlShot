@@ -1,7 +1,0 @@
-# 构建产物
-target/
-*.deb
-debian/owlshot/
-
-# IDE
-.trae/
