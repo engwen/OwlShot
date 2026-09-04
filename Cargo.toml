@@ -1,0 +1,24 @@
+[package]
+name = "owlshot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# XDG Desktop Portal 封装：截图与全局快捷键能力唯一来源，禁止任何 X11 API
+ashpd = { version = "0.13", default-features = false, features = [
+    "tokio",
+    "screenshot",
+    "global_shortcuts",
+] }
+# StatusNotifierItem 系统托盘（freedesktop 标准，Wayland 原生可用）
+ksni = "0.3"
+# GTK4：Wayland 原生剪贴板 + 后续阶段2 标注编辑器
+gtk4 = { version = "0.11", features = ["v4_14"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+async-channel = "2"
+anyhow = "1"
+# toml 配置文件解析（~/.config/owlshot/config.toml）
+toml = "1.1"
+serde = { version = "1.0", features = ["derive"] }
+# 消费 portal GlobalShortcuts 的 Activated 信号流
+futures-util = { version = "0.3", default-features = false }

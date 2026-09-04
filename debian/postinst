@@ -1,0 +1,31 @@
+#!/bin/sh
+set -e
+
+printf '\n  OwlShot installed to /usr/bin/owlshot\n\n'
+
+# GNOME 自定义快捷键无法通过 postinst 自动配置：
+# dconf 直写不经过 gsettings schema，GNOME media-keys 读不到。
+# 必须通过「设置 → 键盘 → 自定义快捷键」GUI 添加，或执行下面的脚本。
+
+printf '  ═══════════════════════════════════════════════════\n'
+printf '  GNOME 快捷键绑定（仅 GNOME 桌面需要）：\n\n'
+printf '  1. 打开「设置 → 键盘 → 自定义快捷键」\n'
+printf '  2. 点击「添加」\n'
+printf '     名称：OwlShot 框选截图\n'
+printf '     命令：/usr/bin/owlshot --region\n'
+printf '     快捷键：Ctrl+Alt+A\n\n'
+printf '  3. （可选）再添加：\n'
+printf '     名称：OwlShot 全屏截图\n'
+printf '     命令：/usr/bin/owlshot --full\n'
+printf '     快捷键：Ctrl+Alt+S\n\n'
+printf '  4. （可选）添加历史回溯：\n'
+printf '     名称：OwlShot 上一张      命令：/usr/bin/owlshot --history 1  快捷键：Ctrl+Alt+1\n'
+printf '     名称：OwlShot 上上张      命令：/usr/bin/owlshot --history 2  快捷键：Ctrl+Alt+2\n'
+printf '     名称：OwlShot 上上上张    命令：/usr/bin/owlshot --history 3  快捷键：Ctrl+Alt+3\n\n'
+printf '  5. （可选）贴图功能：\n'
+printf '     名称：OwlShot 贴图\n'
+printf '     命令：/usr/bin/owlshot --paste\n'
+printf '     快捷键：Ctrl+Shift+V\n'
+printf '  ═══════════════════════════════════════════════════\n\n'
+
+printf '  Recommended: sudo apt install wl-clipboard\n\n'

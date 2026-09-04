@@ -1,0 +1,12 @@
+Package: owlshot
+Version: 0.1.0-1
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: libgtk-4-1 (>= 4.6), libgdk-pixbuf-2.0-0
+Recommends: wl-clipboard
+Maintainer: engwen <engwen@localhost>
+Description: OwlShot - Wayland native screenshot tool
+ OwlShot 是一个 Wayland 原生截图工具，通过 xdg-desktop-portal 抓屏，
+ GTK4 + Cairo 自绘标注编辑器，支持矩形/椭圆/箭头/画笔/马赛克/文字标注，
+ 撤销、自定义颜色与线宽、剪贴板历史、贴图浮动窗口。
