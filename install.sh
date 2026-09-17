@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEB_PKG="${SCRIPT_DIR}/owlshot_0.1.0-1_amd64.deb"
+DEB_PKG="${SCRIPT_DIR}/owlshot_0.1.1-1_amd64.deb"
 
 if [ ! -f "${DEB_PKG}" ]; then
     echo "[install] 找不到 deb 包：${DEB_PKG}"

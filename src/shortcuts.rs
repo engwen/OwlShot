@@ -19,6 +19,7 @@ use futures_util::StreamExt;
 /// 快捷键 id，portal 回调里用它区分动作。
 const ID_REGION: &str = "capture-region";
 const ID_FULLSCREEN: &str = "capture-fullscreen";
+const ID_PASTE: &str = "paste-pin";
 
 /// Session 一旦 drop（或 close）快捷键即失效，必须持有到进程退出。
 pub struct ShortcutGuard {
@@ -64,6 +65,7 @@ pub async fn register(
     let shortcuts = [
         new_shortcut(ID_REGION, "框选截图", &cfg.region),
         new_shortcut(ID_FULLSCREEN, "全屏截图", &cfg.fullscreen),
+        new_shortcut(ID_PASTE, "贴图", &cfg.paste),
     ];
 
     // 无自有窗口，parent window identifier 传 None。
@@ -111,6 +113,7 @@ async fn dispatch_loop(
         let action = match activated.shortcut_id() {
             ID_REGION => Action::CaptureRegion,
             ID_FULLSCREEN => Action::CaptureFullScreen,
+            ID_PASTE => Action::PastePin,
             other => {
                 eprintln!("[owlshot] 收到未知快捷键 id：{other}");
                 continue;

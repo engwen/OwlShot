@@ -99,7 +99,7 @@ fn print_help() {
   owlshot --full       单次全屏截图后退出
   owlshot --window     单次窗口截图后退出（需开启 advanced.use_mutter_overlay，仅 GNOME）
   owlshot --history N  把第 N 条历史（1 = 上一张，最多 {max}）写回剪贴板，再按 Ctrl+V 粘贴
-  owlshot --paste      把剪贴板里的图片贴成屏幕上的浮动窗口（Esc 关闭）
+  owlshot --paste      把剪贴板里的图片贴成屏幕上的浮动窗口（需先截图一次）
   owlshot --help       显示本帮助
   owlshot --version    显示版本号
 
@@ -168,6 +168,9 @@ fn main() -> Result<()> {
 
     gtk4::init().context("GTK4 初始化失败，请确认运行在图形会话中")?;
 
+    // 初始化贴图 channel：在 GLib 主循环中轮询工作线程发来的贴图请求。
+    pin::init_paste_channel();
+
     let main_loop = glib::MainLoop::new(None, false);
     let (tx, rx) = async_channel::unbounded::<Action>();
 
@@ -234,6 +237,7 @@ async fn worker(
                 // 单次模式必须等窗口关掉才退出，否则进程一结束贴图就跟着消失。
                 if let Err(err) = pin::paste_from_clipboard(!daemon).await {
                     eprintln!("[owlshot] 贴图失败：{err:#}");
+                    eprintln!("[owlshot] 提示：先截图一次（Ctrl+Shift+A），再按贴图快捷键（Ctrl+Shift+V）");
                 }
             }
             capture => run_capture(capture).await,

@@ -1,24 +1,41 @@
-//! 需求5：贴图窗口 —— 把剪贴板里的图片贴成屏幕上的一块浮动窗口。
+//! 贴图窗口 —— 把剪贴板里的图片贴到屏幕上，用于数据对比（类似 Snipaste 贴图功能）。
 //!
-//! Wayland 限制（已与用户确认接受降级）：
-//!   GNOME 不支持 wlr-layer-shell，GTK4 也没有 X11 那种 keep-above 接口，
-//!   因此只能做到「贴出瞬间位于最前面」，切到别的窗口后会被盖住；
-//!   窗口位置同样不能由程序指定，移动必须交给合成器（`gdk_toplevel_begin_move`）。
+//! 功能：置顶（keep_above）、左键拖动、滚轮缩放、Esc/关闭按钮退出、悬停显示控制栏。
 //!
-//! 交互：左键拖动移动、滚轮缩放、Esc 或右键关闭。
-//!
-//! 线程：由工作线程调用，窗口构建投递到 GLib 主线程；
-//! 直到窗口关闭才回传结果，否则单次模式（`owlshot --paste`）会在贴出瞬间就退出。
+//! 线程模型：贴图窗口必须在 GLib 主线程创建（剪贴板读取、窗口 present 都需要主上下文），
+//! 但工作循环跑在 tokio 线程上。因此用 `std::sync::mpsc` 从工作线程向主线程发送贴图请求，
+//! 主线程通过 GLib timeout 轮询接收，处理后通过 oneshot channel 回传结果。
 
 use anyhow::{Context as _, Result, anyhow};
 use gtk4::gdk;
 use gtk4::prelude::*;
 use gtk4::{
-    ContentFit, EventControllerKey, EventControllerScroll, EventControllerScrollFlags, GestureClick,
-    GestureDrag, Picture, Window, glib,
+    Align, Button, ContentFit, EventControllerKey, EventControllerMotion,
+    EventControllerScroll, EventControllerScrollFlags, GestureClick, GestureDrag, Label,
+    Orientation, Overlay, Picture, Window, glib,
 };
 use std::cell::Cell;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::sync::OnceLock;
+
+/// 设置窗口置顶/取消置顶。
+/// 通过 GObject 属性 `keep-above` 直写，兼容所有支持该属性的合成器。
+fn set_keep_above(window: &Window, keep: bool) {
+    let val = glib::Value::from(keep);
+    window.set_property("keep-above", &val);
+}
+
+/// 剪贴板为空时的降级方案：从历史目录读取最近一次截图文件。
+fn load_latest_screenshot() -> Result<PathBuf> {
+    let dir = crate::history::dir();
+    let entries = crate::history::entries(&dir);
+    entries
+        .into_iter()
+        .next()
+        .with_context(|| format!("历史目录 {} 为空，请先截图一次", dir.display()))
+}
 
 /// 缩放下限 / 上限，相对初始逻辑尺寸。
 const MIN_SCALE: f64 = 0.1;
@@ -30,90 +47,194 @@ const DRAG_SLOP: f64 = 4.0;
 /// 初始尺寸最多占屏幕的比例：贴一张全屏图时不至于糊满整个桌面。
 const MAX_SCREEN_RATIO: f64 = 0.9;
 
-/// 把剪贴板里的图片贴到屏幕上。
-///
-/// `wait_for_close` 为真（`owlshot --paste` 单次模式）时一直等到窗口关闭，
-/// 否则进程会在贴出瞬间退出把窗口带走；常驻模式传假，工作循环立刻回去响应托盘。
-pub async fn paste_from_clipboard(wait_for_close: bool) -> Result<()> {
-    let (tx, rx) = async_channel::bounded::<Result<(), String>>(1);
-
-    glib::MainContext::default().invoke(move || {
-        // 读剪贴板是异步操作，且必须在持有主上下文的线程上发起。
-        glib::spawn_future_local(async move {
-            if let Err(err) = open(tx.clone(), wait_for_close).await {
-                let _ = tx.try_send(Err(format!("{err:#}")));
-            }
-        });
-    });
-
-    rx.recv()
-        .await
-        .context("GLib 主循环未响应贴图任务")?
-        .map_err(|err| anyhow!(err))
+/// 工作线程 → 主线程的贴图请求。
+pub struct PinRequest {
+    /// 主线程处理完毕后通过此 oneshot 回传结果。
+    pub result_tx: tokio::sync::oneshot::Sender<Result<()>>,
+    /// 单次模式（`owlshot --paste`）为真：窗口关闭前不回传，进程不会提前退出。
+    pub wait_for_close: bool,
 }
 
-/// 结果只允许回传一次：常驻模式在 present 后就放行，关窗回调不该再发一次。
-struct Done {
-    tx: async_channel::Sender<Result<(), String>>,
-    sent: Cell<bool>,
-}
+/// `mpsc::Sender<PinRequest>`，从主线程初始化后交给工作线程。
+static PASTE_TX: OnceLock<mpsc::Sender<PinRequest>> = OnceLock::new();
 
-impl Done {
-    fn send(&self, result: Result<(), String>) {
-        if self.sent.replace(true) {
-            return;
+/// 在主线程调用：初始化贴图 channel，返回 receiver 并安装 GLib timeout 轮询。
+pub fn init_paste_channel() {
+    let (tx, rx) = mpsc::channel::<PinRequest>();
+    let _ = PASTE_TX.set(tx);
+
+    // 每 50ms 轮询一次，检查是否有贴图请求。
+    glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        while let Ok(req) = rx.try_recv() {
+            let wait = req.wait_for_close;
+            glib::spawn_future_local(async move {
+                handle_paste(wait, req.result_tx).await;
+            });
         }
-        // 容量 1 且只发一次，try_send 不会丢结果，也不会阻塞主循环。
-        let _ = self.tx.try_send(result);
-    }
+        glib::ControlFlow::Continue
+    });
 }
 
-/// 主线程：读剪贴板取图 → 建无边框浮动窗口。
-async fn open(tx: async_channel::Sender<Result<(), String>>, wait_for_close: bool) -> Result<()> {
-    let display = gdk::Display::default().context("拿不到 GDK Display，请确认运行在图形会话中")?;
-    let texture = display
+/// 工作线程调用：向主线程发送贴图请求，阻塞等待结果。
+pub async fn paste_from_clipboard(wait_for_close: bool) -> Result<()> {
+    let tx = PASTE_TX
+        .get()
+        .context("贴图 channel 未初始化（init_paste_channel 未在主线程调用）")?;
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(PinRequest {
+        result_tx,
+        wait_for_close,
+    });
+    result_rx
+        .await
+        .context("主线程未响应贴图请求")?
+}
+
+/// 主线程：读剪贴板 → 建浮动窗口。由 GLib timeout 轮询触发。
+async fn handle_paste(
+    wait_for_close: bool,
+    result_tx: tokio::sync::oneshot::Sender<Result<()>>,
+) {
+    // try_open 内部处理所有错误并通过 result_tx 回传，此处只需驱动调用。
+    let _ = try_open(wait_for_close, result_tx).await;
+}
+
+/// 实际贴图逻辑：创建窗口并通过 `result_tx` 回传结果。
+///
+/// 窗口布局：Overlay 覆盖一个 control_bar（置顶 + 关闭），
+/// 悬停在图片上时 control_bar 可见，离开时隐藏。
+async fn try_open(
+    wait_for_close: bool,
+    result_tx: tokio::sync::oneshot::Sender<Result<()>>,
+) -> Result<()> {
+    let display = match gdk::Display::default() {
+        Some(d) => d,
+        None => {
+            let _ = result_tx.send(Err(anyhow!("拿不到 GDK Display，请确认运行在图形会话中")));
+            return Ok(());
+        }
+    };
+
+    let texture = match display
         .clipboard()
         .read_texture_future()
         .await
-        .map_err(|err| anyhow!("读取剪贴板图片失败：{err}"))?
-        .context("剪贴板里没有图片；先截一张图，或用托盘「粘贴历史」取回一张")?;
+    {
+        Ok(Some(tex)) => tex,
+        Ok(None) | Err(_) => {
+            // 剪贴板为空（wl-copy 未安装或失败），自动读取最近一次截图文件。
+            match load_latest_screenshot() {
+                Ok(path) => {
+                    match gdk::Texture::from_filename(&path) {
+                        Ok(tex) => tex,
+                        Err(err) => {
+                            let _ = result_tx.send(Err(anyhow!("无法加载截图文件 {}：{err}", path.display())));
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = result_tx.send(Err(anyhow!("剪贴板无图片且找不到截图历史：{err}；请先截图一次")));
+                    return Ok(());
+                }
+            }
+        }
+    };
 
-    let done = Rc::new(Done {
-        tx,
-        sent: Cell::new(false),
-    });
     let base = initial_size(&texture);
 
     let window = Window::new();
     window.set_decorated(false);
     window.set_title(Some("OwlShot 贴图"));
     window.set_default_size(base.0, base.1);
+    // 置顶：在 GNOME/KDE/Sway 等主流 Wayland 合成器上均有效。
+    set_keep_above(&window, true);
 
-    // 让图随窗口尺寸拉伸，并允许缩到比原图更小：窗口多大就画多大。
+    // --- 图片 ---
     let picture = Picture::for_paintable(&texture);
     picture.set_can_shrink(true);
     picture.set_content_fit(ContentFit::Fill);
-    window.set_child(Some(&picture));
+
+    // --- 控制栏：置顶切换 + 关闭 ---
+    let control_bar = gtk4::Box::new(Orientation::Horizontal, 4);
+    control_bar.set_margin_top(4);
+    control_bar.set_margin_start(4);
+    control_bar.set_halign(Align::Start);
+    control_bar.set_valign(Align::Start);
+    control_bar.add_css_class("osd"); // 半透明背景
+
+    // 置顶按钮（toggle）：初始已置顶
+    let pin_label = Label::new(Some("📌"));
+    let pin_btn = Button::builder().child(&pin_label).tooltip_text("取消置顶").build();
+    let win_ref = window.clone();
+    let pin_state = Rc::new(Cell::new(true));
+    {
+        let pin_state = pin_state.clone();
+        pin_btn.connect_clicked(move |btn| {
+            let next = !pin_state.get();
+            pin_state.set(next);
+            set_keep_above(&win_ref, next);
+            btn.set_tooltip_text(Some(if next { "取消置顶" } else { "置顶" }));
+        });
+    }
+
+    // 关闭按钮
+    let close_btn = Button::builder()
+        .label("✕")
+        .tooltip_text("关闭（Esc）")
+        .build();
+    {
+        let win_ref = window.clone();
+        close_btn.connect_clicked(move |_| win_ref.close());
+    }
+
+    control_bar.append(&pin_btn);
+    control_bar.append(&close_btn);
+
+    // --- Overlay：图片 + 控制栏浮层 ---
+    let overlay = Overlay::new();
+    overlay.set_child(Some(&picture));
+    overlay.add_overlay(&control_bar);
+
+    window.set_child(Some(&overlay));
+
+    // 悬停检测：鼠标进入窗口区域时显示控制栏，离开时隐藏。
+    control_bar.set_visible(false);
+    {
+        let bar = control_bar.clone();
+        let motion = EventControllerMotion::new();
+        motion.connect_enter(move |_, _, _| bar.set_visible(true));
+        let bar2 = control_bar.clone();
+        motion.connect_leave(move |_| bar2.set_visible(false));
+        overlay.add_controller(motion);
+    }
 
     wire_drag(&window);
     wire_zoom(&window, base);
     wire_close(&window);
 
-    {
-        let done = done.clone();
+    window.present();
+
+    // 用 Rc 包装 oneshot sender，让闭包和后续代码都能拿到。
+    let result_tx = Rc::new(Cell::new(Some(result_tx)));
+
+    if wait_for_close {
+        // 单次模式：窗口关闭时通过 oneshot 回传结果，进程不会提前退出。
+        let tx = result_tx.clone();
         window.connect_close_request(move |_| {
-            done.send(Ok(()));
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(Ok(()));
+            }
             glib::Propagation::Proceed
         });
+    } else {
+        // 常驻模式：窗口已映射，立即回传，工作循环继续响应托盘。
+        if let Some(tx) = result_tx.take() {
+            let _ = tx.send(Ok(()));
+        }
     }
 
-    window.present();
-    if !wait_for_close {
-        // 窗口已映射，GTK 自己持有引用，交给主循环继续活着即可。
-        done.send(Ok(()));
-    }
-    println!("[owlshot] 已贴出剪贴板图片：拖动可移动、滚轮缩放、Esc 或右键关闭。");
-    println!("[owlshot] 注意：Wayland 无置顶接口，切到其他窗口后贴图会被盖住。");
+    println!("[owlshot] 贴图已置顶显示：悬停控制栏可切换置顶/关闭，滚轮缩放，Esc 关闭。");
     Ok(())
 }
 

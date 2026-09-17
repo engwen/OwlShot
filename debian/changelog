@@ -1,3 +1,9 @@
+owlshot (0.1.1-1) unstable; urgency=low
+
+  * Add "贴图" (pin) entry to tray right-click menu.
+
+ -- engwen <engwen@localhost>  Thu, 04 Sep 2026 00:00:00 +0800
+
 owlshot (0.1.0-1) unstable; urgency=low
 
   * Initial release.

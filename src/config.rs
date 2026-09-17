@@ -31,6 +31,8 @@ pub struct ShortcutsConfig {
     pub region: String,
     /// 全屏截图触发器。
     pub fullscreen: String,
+    /// 贴图触发器（Ctrl+Shift+V）。
+    pub paste: String,
 }
 
 impl Default for ShortcutsConfig {
@@ -39,6 +41,7 @@ impl Default for ShortcutsConfig {
             enabled: true,
             region: "CTRL+SHIFT+a".to_string(),
             fullscreen: "CTRL+SHIFT+s".to_string(),
+            paste: "CTRL+SHIFT+v".to_string(),
         }
     }
 }
@@ -190,6 +193,8 @@ enabled = true
 # 键名取自 xkbcommon keysym（如 a、Print、space、Return）。
 region = "CTRL+SHIFT+a"
 fullscreen = "CTRL+SHIFT+s"
+# 贴图（Ctrl+Shift+V）：把剪贴板里的图片贴到屏幕上，用于数据对比。
+paste = "CTRL+SHIFT+v"
 
 [capture]
 # 保存目录，留空 = XDG 图片目录下的 Screenshots，可写 "~/Pictures/shots"。
