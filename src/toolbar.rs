@@ -6,7 +6,7 @@
 //!   3. 图标用矢量直接画，不引入任何图标资源与额外依赖。
 //! 本模块只做布局 / 绘制 / 命中，不持有状态，动作交回 editor 处理。
 
-use crate::annotate::{Color, PALETTE, Rect, Tool};
+use crate::annotate::{Color, FONT_SIZES, PALETTE, Rect, Tool};
 use gtk4::cairo;
 use std::f64::consts::{PI, TAU};
 
@@ -31,6 +31,12 @@ pub enum Item {
     Tool(Tool),
     /// 调色板色块，取值为 `PALETTE` 下标。
     Color(usize),
+    /// 字号下拉框按钮（点击展开/收起）。
+    FontSizeDrop,
+    /// 字号下拉列表中的某个选项，取值为 `FONT_SIZES` 下标。仅在下拉展开时存在。
+    FontSizePick(usize),
+    /// 调色盘：打开系统颜色选择器。
+    ColorPicker,
     Undo,
     Redo,
     Copy,
@@ -38,8 +44,8 @@ pub enum Item {
     Cancel,
 }
 
-/// 按钮顺序：11 个标注工具 / 8 个调色板色块 / 5 个操作按钮，三组之间留间隙。
-const ITEMS: [Item; 24] = [
+/// 按钮顺序：11 个标注工具 / 1 个字号下拉框 / 8 个调色板色块 + 1 个调色盘 / 5 个操作按钮，四组之间留间隙。
+const ITEMS: [Item; 26] = [
     Item::Tool(Tool::Rect),
     Item::Tool(Tool::FillRect),
     Item::Tool(Tool::Ellipse),
@@ -51,6 +57,7 @@ const ITEMS: [Item; 24] = [
     Item::Tool(Tool::Mosaic),
     Item::Tool(Tool::Blur),
     Item::Tool(Tool::Text),
+    Item::FontSizeDrop,
     Item::Color(0),
     Item::Color(1),
     Item::Color(2),
@@ -59,6 +66,7 @@ const ITEMS: [Item; 24] = [
     Item::Color(5),
     Item::Color(6),
     Item::Color(7),
+    Item::ColorPicker,
     Item::Undo,
     Item::Redo,
     Item::Copy,
@@ -67,7 +75,10 @@ const ITEMS: [Item; 24] = [
 ];
 
 /// 分组分界下标：这些按钮之前插入 SEP 间隙。
-const BREAKS: [usize; 2] = [11, 19];
+const BREAKS: [usize; 3] = [11, 12, 21];
+
+/// 字号下拉按钮宽度（比普通按钮宽，能放下 "18 ▾" 标签）。
+const DROP_W: f64 = BTN * 2.2;
 
 /// 一次布局的结果：整体范围 + 每个按钮的矩形。
 pub struct Toolbar {
@@ -81,14 +92,24 @@ impl Toolbar {
     /// 横向：以选区水平中心为基准居中，超出视口时左右夹住。
     /// 纵向：贴在选区底边下方 MARGIN 处；放不下时整体上移到选区上方。
     /// 按钮太多一行放不下时自动换行。
-    pub fn layout(rect: &Rect, vw: f64, vh: f64) -> Self {
+    pub fn layout(rect: &Rect, vw: f64, vh: f64, font_size_drop_open: bool) -> Self {
+        // 计算每列宽度：普通按钮 BTN，字号下拉框 DROP_W。
+        let col_widths: Vec<f64> = ITEMS
+            .iter()
+            .map(|item| {
+                if *item == Item::FontSizeDrop {
+                    DROP_W
+                } else {
+                    BTN
+                }
+            })
+            .collect();
         let total = ITEMS.len();
-        // 每行最多放几个：视口宽度与 MAX_PER_ROW 双重约束，并预留分组间隙。
-        let avail_w = vw - PAD * 2.0;
+        // 估算一行能放多少列：用 BTN 作基准，再微调。
+        let avail_w = vw - PAD * 2.0 - SEP * 2.0;
         let fit = ((avail_w + GAP) / (BTN + GAP)).floor() as usize;
         let per_row = fit.clamp(1, MAX_PER_ROW).min(total);
         let rows = total.div_ceil(per_row);
-        // 按行数反算每行按钮数，让各行均摊，避免末行只剩一两个。
         let cols = total.div_ceil(rows);
 
         // 记录每个分组分界所在行及其行内列号，用于后续偏移。
@@ -96,14 +117,20 @@ impl Toolbar {
             .iter()
             .map(|&b| (b / cols, b % cols))
             .collect();
-        // 逐行累加横向偏移：行内分组分界之后的按钮额外多让出 SEP。
-        let mut extra = vec![0.0f64; rows];
-        for &(br, _bc) in &break_locs {
-            extra[br] += SEP;
-        }
-        let pad_h = extra.iter().copied().fold(0.0, f64::max);
-
-        let w = PAD * 2.0 + cols as f64 * BTN + (cols as f64 - 1.0) * GAP + pad_h;
+        // 计算最大行宽（各列按实际宽度累加）。
+        let row_width = |row: usize| -> f64 {
+            let start = row * cols;
+            let end = (start + cols).min(total);
+            let base: f64 = col_widths[start..end].iter().sum::<f64>()
+                + GAP * (end - start - 1) as f64;
+            let off: f64 = break_locs
+                .iter()
+                .filter(|&&(br, _bc)| br == row)
+                .count() as f64
+                * SEP;
+            base + off
+        };
+        let w = PAD * 2.0 + (0..rows).map(row_width).fold(0.0f64, f64::max);
         let h = PAD * 2.0 + rows as f64 * BTN + (rows as f64 - 1.0) * GAP;
 
         // 横向右对齐于选区右边缘。
@@ -116,21 +143,56 @@ impl Toolbar {
             (rect.top() - MARGIN - h).clamp(0.0, (vh - h).max(0.0))
         };
 
-        let bounds = Rect::new(x, y, x + w, y + h);
+        let mut bounds = Rect::new(x, y, x + w, y + h);
         let mut slots = Vec::with_capacity(total);
+        let mut drop_rect = Rect::new(0.0, 0.0, 0.0, 0.0);
+
         for (i, item) in ITEMS.into_iter().enumerate() {
             let (row, col) = (i / cols, i % cols);
-            // 本按钮之前有几个分组分界，每个分界多让出 SEP。
-            let off: f64 = break_locs
+            // 计算该列的累计 X 偏移。
+            let start = row * cols;
+            let col_x_off: f64 = col_widths[start..start + col]
+                .iter()
+                .map(|w| w + GAP)
+                .sum();
+            let break_off: f64 = break_locs
                 .iter()
                 .filter(|&&(br, bc)| br == row && bc < col)
                 .count() as f64
                 * SEP;
-            let bx = x + PAD + col as f64 * (BTN + GAP) + off;
+            let bx = x + PAD + col_x_off + break_off;
             let by = y + PAD + row as f64 * (BTN + GAP);
-            slots.push((item, Rect::new(bx, by, bx + BTN, by + BTN)));
+            let cw = col_widths[i];
+            let r = Rect::new(bx, by, bx + cw, by + BTN);
+            if item == Item::FontSizeDrop {
+                drop_rect = r;
+            }
+            slots.push((item, r));
         }
-        Self { bounds, slots }
+
+        // 下拉展开时，追加字号选项到 slots，并扩展 bounds 包含下拉区域。
+        if font_size_drop_open {
+            let opt_h = BTN * 0.85;
+            let opt_x = drop_rect.left();
+            let mut opt_y = drop_rect.bottom() + 2.0;
+            for (i, _size) in FONT_SIZES.iter().enumerate() {
+                slots.push((
+                    Item::FontSizePick(i),
+                    Rect::new(opt_x, opt_y, opt_x + DROP_W, opt_y + opt_h),
+                ));
+                opt_y += opt_h + 1.0;
+            }
+            // 下拉列表下方留出一点 padding。
+            let drop_bottom = opt_y + 2.0;
+            if drop_bottom > bounds.bottom() {
+                bounds = Rect::new(bounds.left(), bounds.top(), bounds.right(), drop_bottom);
+            }
+        }
+
+        Self {
+            bounds,
+            slots,
+        }
     }
 
     /// 命中测试；工具栏区域内的点击不应落到画布上。
@@ -152,6 +214,7 @@ impl Toolbar {
         active: Option<Tool>,
         hover: Option<Item>,
         color: Color,
+        font_size: f64,
         can_undo: bool,
         can_redo: bool,
     ) {
@@ -167,6 +230,7 @@ impl Toolbar {
             let selected = match item {
                 Item::Tool(t) => active == Some(t),
                 Item::Color(i) => PALETTE[i] == color,
+                Item::FontSizePick(i) => (FONT_SIZES[i] - font_size).abs() < 0.5,
                 _ => false,
             };
             let dimmed = (item == Item::Undo && !can_undo) || (item == Item::Redo && !can_redo);
@@ -183,6 +247,100 @@ impl Toolbar {
                     let a = if selected { 0.95 } else { 0.35 };
                     cr.set_source_rgba(1.0, 1.0, 1.0, a);
                     let _ = cr.stroke();
+                }
+                continue;
+            }
+
+            // 字号下拉框：显示当前字号 + 下箭头。
+            if item == Item::FontSizeDrop {
+                if hover == Some(item) {
+                    rounded_rect(cr, r.left(), r.top(), r.width(), r.height(), 4.0);
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.14);
+                    let _ = cr.fill();
+                }
+                // 字号数值。
+                let label = format!("{} ▾", font_size as i32);
+                cr.select_font_face(
+                    "sans-serif",
+                    cairo::FontSlant::Normal,
+                    cairo::FontWeight::Normal,
+                );
+                cr.set_font_size(11.0);
+                if let Ok(ext) = cr.text_extents(&label) {
+                    cr.new_path();
+                    cr.move_to(
+                        r.left() + (r.width() - ext.width()) / 2.0 - ext.x_bearing(),
+                        r.top() + (r.height() - ext.height()) / 2.0 - ext.y_bearing(),
+                    );
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.92);
+                    let _ = cr.show_text(&label);
+                }
+                continue;
+            }
+
+            // 字号下拉选项。
+            if let Item::FontSizePick(i) = item {
+                // 弹出菜单背景（仅第一个选项时画整个背景）。
+                if i == 0 {
+                    let pop_top = r.top();
+                    let pop_h = FONT_SIZES.len() as f64 * (BTN * 0.85 + 1.0) + 4.0;
+                    rounded_rect(cr, r.left() - 2.0, pop_top - 2.0, r.width() + 4.0, pop_h, 5.0);
+                    cr.set_source_rgba(0.10, 0.11, 0.13, 0.97);
+                    let _ = cr.fill();
+                }
+                if selected {
+                    rounded_rect(cr, r.left(), r.top(), r.width(), r.height(), 3.0);
+                    cr.set_source_rgba(0.20, 0.55, 1.0, 0.85);
+                    let _ = cr.fill();
+                } else if hover == Some(item) {
+                    rounded_rect(cr, r.left(), r.top(), r.width(), r.height(), 3.0);
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.14);
+                    let _ = cr.fill();
+                }
+                let label = format!("{} px", FONT_SIZES[i] as i32);
+                cr.select_font_face(
+                    "sans-serif",
+                    cairo::FontSlant::Normal,
+                    cairo::FontWeight::Normal,
+                );
+                cr.set_font_size(11.0);
+                if let Ok(ext) = cr.text_extents(&label) {
+                    cr.new_path();
+                    cr.move_to(
+                        r.left() + (r.width() - ext.width()) / 2.0 - ext.x_bearing(),
+                        r.top() + (r.height() - ext.height()) / 2.0 - ext.y_bearing(),
+                    );
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.92);
+                    let _ = cr.show_text(&label);
+                }
+                continue;
+            }
+
+            // 调色盘按钮：渐变彩色圆。
+            if item == Item::ColorPicker {
+                if hover == Some(item) {
+                    rounded_rect(cr, r.left(), r.top(), r.width(), r.height(), 4.0);
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.14);
+                    let _ = cr.fill();
+                }
+                let cx = r.left() + r.width() / 2.0;
+                let cy = r.top() + r.height() / 2.0;
+                let radius = BTN * 0.35;
+                // 画四个彩色扇区示意调色盘。
+                let colors = [
+                    (1.0, 0.3, 0.3),
+                    (0.3, 1.0, 0.3),
+                    (0.3, 0.3, 1.0),
+                    (1.0, 1.0, 0.3),
+                ];
+                for (i, &(cr_r, cg, cb)) in colors.iter().enumerate() {
+                    let start = PI * 0.5 * i as f64;
+                    cr.new_path();
+                    cr.move_to(cx, cy);
+                    cr.arc(cx, cy, radius, start, start + PI * 0.5);
+                    cr.close_path();
+                    cr.set_source_rgb(cr_r, cg, cb);
+                    let _ = cr.fill();
                 }
                 continue;
             }
@@ -342,6 +500,11 @@ fn draw_icon(cr: &cairo::Context, item: Item, slot: &Rect) {
         }
         // 色块在 draw 里已单独绘制，不走图标路径。
         Item::Color(_) => {}
+        // 字号按钮在 draw 里已单独绘制，不走图标路径。
+        Item::FontSizeDrop => {}
+        Item::FontSizePick(_) => {}
+        // 调色盘在 draw 里已单独绘制，不走图标路径。
+        Item::ColorPicker => {}
         Item::Undo => {
             // 逆时针弧 + 箭头尾，表示回退一步。
             let (cx, cy) = p(8.5, 9.0);

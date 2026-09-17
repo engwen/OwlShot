@@ -97,6 +97,12 @@ pub const DEFAULT_COLOR: Color = PALETTE[0];
 /// 默认线宽。
 pub const DEFAULT_STROKE: f64 = 3.0;
 
+/// 默认字号（逻辑像素）。
+pub const DEFAULT_FONT_SIZE: f64 = 18.0;
+
+/// 可选字号列表。
+pub const FONT_SIZES: [f64; 5] = [12.0, 16.0, 20.0, 28.0, 40.0];
+
 /// 线宽可调范围（滚轮调节的上下限）。
 pub const STROKE_MIN: f64 = 1.0;
 pub const STROKE_MAX: f64 = 20.0;
@@ -107,19 +113,22 @@ const MARKER_SCALE: f64 = 3.0;
 
 /// 新建图元时的样式快照。
 ///
-/// 字号 / 马赛克块 / 模糊强度 / 序号圆都由线宽派生，滚轮一个通道即可调所有工具的粗细。
+/// 字号由独立的 `font_size` 字段控制，与线宽解耦。
+/// 马赛克块 / 模糊强度 / 序号圆仍由线宽派生。
 #[derive(Clone, Copy)]
 pub struct Style {
     pub color: Color,
     pub stroke: f64,
     /// 序号计数器工具的下一个编号。
     pub counter: u32,
+    /// 文字字号（逻辑像素）。
+    pub font_size: f64,
 }
 
 impl Style {
-    /// 文字字号：默认线宽 3 对应 18px。
+    /// 文字字号：直接使用 font_size 字段。
     pub fn font_size(&self) -> f64 {
-        (self.stroke * 6.0).clamp(12.0, 96.0)
+        self.font_size.clamp(12.0, 96.0)
     }
 
     /// 马赛克块边长（逻辑像素）。
@@ -583,7 +592,7 @@ fn set_text_font(cr: &cairo::Context, size: f64) {
     cr.set_font_size(size);
 }
 
-/// 多行文字，先描深色轮廓再填色，浅底深底都能看清。
+/// 多行文字，纯填充，无描边。
 fn draw_text(cr: &cairo::Context, pos: (f64, f64), text: &str, color: &Color, size: f64) {
     if text.is_empty() {
         return;
@@ -592,19 +601,14 @@ fn draw_text(cr: &cairo::Context, pos: (f64, f64), text: &str, color: &Color, si
     let Ok(fe) = cr.font_extents() else {
         return;
     };
-    cr.set_line_join(cairo::LineJoin::Round);
-    cr.set_line_width((size * 0.14).max(1.5));
 
+    cr.set_source_rgb(color.r, color.g, color.b);
     let mut y = pos.1 + fe.ascent();
     for line in text.split('\n') {
         if !line.is_empty() {
             cr.new_path();
             cr.move_to(pos.0, y);
-            cr.text_path(line);
-            cr.set_source_rgba(0.0, 0.0, 0.0, 0.55);
-            let _ = cr.stroke_preserve();
-            cr.set_source_rgb(color.r, color.g, color.b);
-            let _ = cr.fill();
+            let _ = cr.show_text(line);
         }
         y += fe.height();
     }

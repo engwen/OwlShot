@@ -2,6 +2,14 @@
 name = "owlshot"
 version = "0.1.1"
 edition = "2024"
+authors = ["OwlShot <owlshot@example.com>"]
+description = "Wayland native screenshot tool with annotation editor"
+license = "GPL-3.0-or-later"
+
+[package.metadata.deb]
+maintainer = "OwlShot <owlshot@example.com>"
+copyright = "2026, OwlShot"
+extended-description = "A Wayland native screenshot tool using xdg-desktop-portal with annotation editor."
 
 [dependencies]
 # XDG Desktop Portal 封装：截图与全局快捷键能力唯一来源，禁止任何 X11 API

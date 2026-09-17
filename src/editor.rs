@@ -9,7 +9,7 @@
 //! 只把最终结果（PNG 路径，或 Ctrl+C 的「已复制」事实）回传给工作线程。
 
 use crate::annotate::{
-    Canvas, PALETTE, Rect, STROKE_MAX, STROKE_MIN, Shape, Style, Tool, draw_preedit,
+    Canvas, FONT_SIZES, PALETTE, Rect, STROKE_MAX, STROKE_MIN, Shape, Style, Tool, draw_preedit,
     draw_text_caret, text_caret_metrics,
 };
 use crate::capture;
@@ -21,8 +21,9 @@ use gtk4::gdk_pixbuf::{Colorspace, Pixbuf};
 use gtk4::prelude::*;
 use gtk4::{cairo, glib};
 use gtk4::{
-    DrawingArea, EventControllerKey, EventControllerMotion, EventControllerScroll,
-    EventControllerScrollFlags, GestureClick, GestureDrag, IMMulticontext, Window,
+    ColorDialog, DrawingArea, EventControllerKey, EventControllerMotion,
+    EventControllerScroll, EventControllerScrollFlags, GestureClick, GestureDrag, IMMulticontext,
+    Window,
 };
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -157,6 +158,8 @@ struct State {
     ///
     /// Wayland 下候选窗由 ibus 自己弹，但这段未确认文本必须客户端自绘，否则用户看不见输入内容。
     preedit: (String, i32),
+    /// 字号下拉框是否展开。
+    font_size_drop_open: bool,
 }
 
 impl State {
@@ -232,7 +235,7 @@ impl State {
             return None;
         }
         let (vw, vh) = self.view;
-        Some(Toolbar::layout(&rect, vw, vh))
+        Some(Toolbar::layout(&rect, vw, vh, self.font_size_drop_open))
     }
 }
 
@@ -282,8 +285,10 @@ fn build_window(
             color: crate::annotate::DEFAULT_COLOR,
             stroke: crate::annotate::DEFAULT_STROKE,
             counter: 1,
+            font_size: crate::annotate::DEFAULT_FONT_SIZE,
         },
         preedit: (String::new(), 0),
+        font_size_drop_open: false,
     }));
 
     let window = Window::new();
@@ -424,6 +429,7 @@ fn draw(cr: &cairo::Context, state: &State) {
             state.tool,
             state.bar_hover,
             state.style.color,
+            state.style.font_size,
             !state.shapes.is_empty(),
             !state.redo.is_empty(),
         );
@@ -798,9 +804,18 @@ fn wire_click(
                 if n_press == 1
                     && let Some(item) = hit
                 {
+                    // 点击非字号相关按钮时关闭下拉框。
+                    if !matches!(item, Item::FontSizeDrop | Item::FontSizePick(_)) {
+                        state.borrow_mut().font_size_drop_open = false;
+                    }
                     activate_item(&state, &window, &outcome, item);
                 }
                 return;
+            }
+            // 点击工具栏外时关闭字号下拉框。
+            if n_press == 1 && state.borrow().font_size_drop_open {
+                state.borrow_mut().font_size_drop_open = false;
+                window.queue_draw();
             }
             if n_press < 2 {
                 return;
@@ -839,6 +854,7 @@ fn activate_item(
             // 与快捷键一致：点当前工具即取消选中，回到选区调整模式。
             st.tool = if st.tool == Some(tool) { None } else { Some(tool) };
             st.commit_active();
+            st.font_size_drop_open = false;
             drop(st);
             window.queue_draw();
         }
@@ -851,6 +867,48 @@ fn activate_item(
             }
             drop(st);
             window.queue_draw();
+        }
+        Item::FontSizeDrop => {
+            let mut st = state.borrow_mut();
+            st.font_size_drop_open = !st.font_size_drop_open;
+            drop(st);
+            window.queue_draw();
+        }
+        Item::FontSizePick(i) => {
+            let mut st = state.borrow_mut();
+            st.style.font_size = FONT_SIZES[i];
+            st.font_size_drop_open = false;
+            drop(st);
+            window.queue_draw();
+        }
+        Item::ColorPicker => {
+            let state = state.clone();
+            let window = window.clone();
+            let dialog = ColorDialog::new();
+            let current = {
+                let st = state.borrow();
+                let c = st.style.color;
+                gdk::RGBA::new(c.r as f32, c.g as f32, c.b as f32, 1.0)
+            };
+            dialog.choose_rgba(
+                Some(&window),
+                Some(&current),
+                None::<&gtk4::gio::Cancellable>,
+                move |result| {
+                    if let Ok(rgba) = result {
+                        let color = crate::annotate::Color {
+                            r: rgba.red() as f64,
+                            g: rgba.green() as f64,
+                            b: rgba.blue() as f64,
+                        };
+                        let mut st = state.borrow_mut();
+                        st.style.color = color;
+                        if let Some(shape) = st.active.as_mut() {
+                            shape.set_color(color);
+                        }
+                    }
+                },
+            );
         }
         Item::Undo => {
             if state.borrow_mut().undo() {
@@ -940,12 +998,19 @@ fn wire_keys(
             // 再按一次同一个键即退出该工具，回到选区调整模式。
             st.tool = if st.tool == Some(tool) { None } else { Some(tool) };
             st.commit_active();
+            st.font_size_drop_open = false;
             drop(st);
             area_ref.queue_draw();
             return glib::Propagation::Stop;
         }
         match key {
             gdk::Key::Escape => {
+                // 先关闭字号下拉框。
+                if state.borrow().font_size_drop_open {
+                    state.borrow_mut().font_size_drop_open = false;
+                    area_ref.queue_draw();
+                    return glib::Propagation::Stop;
+                }
                 // 先退出标注工具，已在选区模式才整体取消。
                 let exited = {
                     let mut st = state.borrow_mut();
