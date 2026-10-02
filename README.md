@@ -3,6 +3,7 @@
 Wayland 原生截图工具。截图能力全部来自 **xdg-desktop-portal** 标准 D-Bus 接口，选区与标注由自绘 GTK4 编辑器完成，**不含任何 X11 代码**。
 
 - 二进制名：`owlshot`
+- 支持：Ubuntu 24.04 LTS / Ubuntu 26.04 LTS（GNOME Wayland）
 - 开发环境：Ubuntu 24.04 / GNOME 46 / Wayland
 - 语言：Rust（edition 2024）
 
@@ -45,6 +46,23 @@ sudo apt install wl-clipboard
 Rust 工具链用 [rustup](https://rustup.rs) 安装即可，最低验证版本 `rustc 1.98.0`。
 
 托盘图标在 GNOME 下需要 AppIndicator 类扩展（如 `gnome-shell-extension-appindicator`）才会显示；没有扩展时程序照样能用，只是顶栏看不到图标——此时请用命令行单次模式。
+
+## Ubuntu 24.04 / 26.04 双版本兼容
+
+- **deb 包两端通用**：二进制最高要求 GLIBC_2.39（rustc 1.98 std 的 pidfd 符号），
+  24.04 的 glibc 恰为 2.39、26.04 更新，任一端构建均可装两端。
+- GTK4 在整个 4.x 系列保持 `libgtk-4.so.1` ABI（只加符号不减）：代码启用的 `v4_14`
+  feature 封顶 4.14 API，24.04（GTK 4.14）与 26.04（4.22+）的运行库都提供。
+- `Depends: libgtk-4-1 (>= 4.14), libc6 (>= 2.39)` 与实际需求一致；glib 在 24.04 的
+  t64 改名（`libglib2.0-0t64`）由 `libgtk-4-1` 传递依赖解决，无需显式声明。
+- **GlobalShortcuts 差异自动适配**：24.04 的 xdg-desktop-portal-gnome 46 不提供
+  `org.freedesktop.portal.GlobalShortcuts`（程序降级提示用 CLI 绑定）；26.04 的
+  新版 portal 已带该接口，程序运行时探测到即自动注册 `[shortcuts]` 配置的快捷键，
+  两条路径互不干扰，无需改配置。
+- 其余能力（portal 截图、PermissionStore 预授权、托盘、Mutter 私有接口默认关闭）两代系统行为一致。
+- 注意：两个版本的 apt 自带 rustc 均低于 edition 2024 要求（24.04 为 1.75），
+  构建必须用 rustup 工具链；rustc 1.98 起默认 rust-lld 不含 multiarch 目录，
+  仓库内 `.cargo/config.toml` 已补 `-L/usr/lib/x86_64-linux-gnu`。
 
 ## 构建
 

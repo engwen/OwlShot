@@ -1,3 +1,16 @@
+owlshot (0.1.2-1) unstable; urgency=low
+
+  * 适配 Ubuntu 26.04，同时保持 24.04 支持。
+  * Depends 下限修正为 libgtk-4-1 (>= 4.14)（编译启用 v4_14 feature 的诚实下限），
+    并显式声明 libc6 (>= 2.39)（rustc 1.98 std 的 pidfd 符号）。
+  * 双版本构建结论：24.04 / 26.04 任一端构建均可装两端（最高 GLIBC_2.39 = 24.04 的
+    glibc 版本；GTK4 只加符号不减，≤4.14 API 两端运行库都提供）。
+  * rustc 1.98 默认改用 rust-lld，不含 multiarch 目录，新增 .cargo/config.toml
+    补 -L/usr/lib/x86_64-linux-gnu。
+  * 26.04 的 xdg-desktop-portal-gnome 已带 GlobalShortcuts，运行时自动启用，无需改动。
+
+ -- engwen <engwen@localhost>  Fri, 02 Oct 2026 00:00:00 +0800
+
 owlshot (0.1.1-1) unstable; urgency=low
 
   * Add "贴图" (pin) entry to tray right-click menu.

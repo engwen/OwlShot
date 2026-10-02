@@ -1,9 +1,9 @@
 Package: owlshot
-Version: 0.1.1-1
+Version: 0.1.2-1
 Section: utils
 Priority: optional
 Architecture: amd64
-Depends: libgtk-4-1 (>= 4.6), libgdk-pixbuf-2.0-0
+Depends: libgtk-4-1 (>= 4.14), libgdk-pixbuf-2.0-0, libc6 (>= 2.39)
 Recommends: wl-clipboard
 Maintainer: engwen <engwen@localhost>
 Description: OwlShot - Wayland native screenshot tool

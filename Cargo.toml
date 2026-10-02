@@ -1,7 +1,9 @@
 [package]
 name = "owlshot"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
+# edition 2024 的最低 rustc；24.04 自带 apt rustc 1.75 装不动，必须走 rustup
+rust-version = "1.85"
 authors = ["OwlShot <owlshot@example.com>"]
 description = "Wayland native screenshot tool with annotation editor"
 license = "GPL-3.0-or-later"

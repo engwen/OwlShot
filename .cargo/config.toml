@@ -1,0 +1,5 @@
+# rustc 1.98 起 x86_64-unknown-linux-gnu 默认链接器从 GNU ld 换成 rust-lld，
+# 而 rust-lld 不含 Debian/Ubuntu multiarch 目录（/usr/lib/x86_64-linux-gnu），
+# 导致 -lgtk-4 等系统库找不到。显式补上 multiarch 搜索路径，24.04 / 26.04 同样适用。
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-L/usr/lib/x86_64-linux-gnu"]

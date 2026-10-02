@@ -1,6 +1,6 @@
 # OwlShot 项目进度文档
 二进制名称：owlshot
-环境：Ubuntu24.04 GNOME Wayland
+环境：Ubuntu24.04 GNOME Wayland（开发/构建基线）；Ubuntu26.04 为运行目标之一，双版本支持
 约束：优先标准xdg‑desktop‑portal；Mutter私有接口仅作为可选开关，默认关闭。
 
 ## TODO列表
@@ -248,6 +248,20 @@
   `gsettings get ...custom-keybindings.custom0 command` 报「没有这个架构」，gsd-media-keys 读不到
 - 因此 postinst 只打印中文手动绑定指引，不再尝试写 dconf
 - 另需注意：gsd-media-keys 的 PATH 通常只有 `/usr/local/bin:/usr/bin:/bin`，命令必须填 `/usr/bin/owlshot --region` 绝对路径
+
+## Ubuntu 26.04 适配（0.1.2-1，同时保持 24.04 支持）
+- **实机已升到 Ubuntu 26.04.1**（GTK4 运行库 4.22.4），26.04 升级会移除 `libgtk-4-dev`，重装即可编译
+- 双版本结论（objdump 实测）：二进制最高要求 **GLIBC_2.39**（rustc 1.98 std 的
+  `pidfd_getpid`/`pidfd_spawnp`）= 24.04 的 glibc 版本 → **任一端构建均可装两端**；
+  GTK4 只加符号不减，`v4_14` feature 封顶的 API 在 4.14（24.04）/ 4.22（26.04）都提供
+- `debian/control` Depends 修正为 `libgtk-4-1 (>= 4.14), libgdk-pixbuf-2.0-0, libc6 (>= 2.39)`：
+  与实际符号需求一致；glib 的 t64 改名由 libgtk-4-1 传递依赖覆盖，不显式声明
+- rustc 1.98 起 x86_64 Linux 默认链接器换成 rust-lld，不含 Debian multiarch 目录，
+  `-lgtk-4` 全部找不到 → 新增 `.cargo/config.toml` 补 `-L/usr/lib/x86_64-linux-gnu`
+- 26.04 portal 带 GlobalShortcuts、24.04 不带 → 已有运行时探测自动启用/降级，代码零改动
+- Cargo.toml 增加 `rust-version = "1.85"`（edition 2024 下限；两代系统 apt rustc 都不够，必须 rustup）
+- 版本统一升 0.1.2：Cargo.toml / debian/control / debian/rules / debian/changelog
+- README 新增「Ubuntu 24.04 / 26.04 双版本兼容」章节（构建规则、依赖依据、GlobalShortcuts 差异）
 
 ## 全局待办（交付给用户的本机实测清单）
 1. `cargo build --release` 后 `install -Dm755 target/release/owlshot ~/.local/bin/owlshot`
