@@ -132,11 +132,140 @@ enum Drag {
     Draw,
 }
 
+/// 一块显示器在全局布局中的信息。
+struct Monitor {
+    /// 全局逻辑坐标中的位置（可能是负数：位于主屏左侧的屏）。
+    pos: (f64, f64),
+    /// 逻辑尺寸。
+    size: (f64, f64),
+    /// 本屏生效的逻辑→物理缩放（HiDPI / 分数缩放）。
+    scale: (f64, f64),
+    /// 本屏左上角在合并原图中的物理坐标。
+    phys: (f64, f64),
+    /// 合并原图中属于本屏的切片；本屏窗口只绘制与命中这片。
+    sub: Pixbuf,
+}
+
+/// 全部显示器的逻辑布局；原点取所有屏逻辑位置的包围盒左上角。
+struct Layout {
+    bounds: Rect,
+    monitors: Vec<Monitor>,
+}
+
+impl Layout {
+    /// 全局逻辑坐标落在哪块屏上。
+    fn monitor_at(&self, x: f64, y: f64) -> Option<usize> {
+        self.monitors.iter().position(|m| {
+            x >= m.pos.0 && x < m.pos.0 + m.size.0 && y >= m.pos.1 && y < m.pos.1 + m.size.1
+        })
+    }
+}
+
+/// 从 Gdk 枚举所有显示器，推出各自在合并原图（portal 全桌面截图）中的物理切片。
+///
+/// portal 返回的是整个虚拟桌面拼成的一张图。常规布局下每屏区域的物理原点 =
+/// （逻辑位置 - 布局原点）× 该屏缩放。混合 DPI 时各屏缩放不同，先按此模型映射，
+/// 再校验总物理尺寸与原图是否吻合；不吻合（未知拼接行为）则退回统一缩放，
+/// 保证任何环境下都不压缩、不崩，只是极端混合 DPI 下像素可能有细微偏移。
+fn probe_layout(shot: &Pixbuf) -> Layout {
+    let (iw, ih) = (shot.width() as f64, shot.height() as f64);
+
+    let mut mons: Vec<((f64, f64), (f64, f64), f64)> = Vec::new(); // (pos, size, scale)
+    if let Some(display) = gdk::Display::default() {
+        let list = display.monitors();
+        for i in 0..list.n_items() {
+            let Some(m) = list
+                .item(i)
+                .and_then(|obj| obj.downcast::<gdk::Monitor>().ok())
+            else {
+                continue;
+            };
+            let g = m.geometry();
+            let s = m.scale();
+            if g.width() <= 0 || g.height() <= 0 || s <= 0.0 {
+                continue;
+            }
+            mons.push(((g.x() as f64, g.y() as f64), (g.width() as f64, g.height() as f64), s));
+        }
+    }
+
+    // 枚举不到显示器：退化为单屏，逻辑坐标 = 物理坐标。
+    if mons.is_empty() {
+        println!("[owlshot] 未枚举到显示器信息，按单屏处理");
+        return Layout {
+            bounds: Rect::new(0.0, 0.0, iw, ih),
+            monitors: vec![Monitor {
+                pos: (0.0, 0.0),
+                size: (iw, ih),
+                scale: (1.0, 1.0),
+                phys: (0.0, 0.0),
+                sub: shot.new_subpixbuf(0, 0, shot.width(), shot.height()),
+            }],
+        };
+    }
+
+    let minx = mons.iter().map(|m| m.0 .0).fold(f64::INFINITY, f64::min);
+    let miny = mons.iter().map(|m| m.0 .1).fold(f64::INFINITY, f64::min);
+    let maxx = mons
+        .iter()
+        .map(|m| m.0 .0 + m.1 .0)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let maxy = mons
+        .iter()
+        .map(|m| m.0 .1 + m.1 .1)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    // 统一缩放（校验失败时的回退）：整张原图摊到全部逻辑面积上。
+    let (ux, uy) = (iw / (maxx - minx), ih / (maxy - miny));
+    let build = |per_monitor: bool| -> Vec<Monitor> {
+        mons.iter()
+            .map(|&(pos, size, s)| {
+                let (sx, sy) = if per_monitor { (s, s) } else { (ux, uy) };
+                let phys = ((pos.0 - minx) * sx, (pos.1 - miny) * sy);
+                let px = phys.0.round().clamp(0.0, iw) as i32;
+                let py = phys.1.round().clamp(0.0, ih) as i32;
+                let pw = ((size.0 * sx).round() as i32).min(shot.width() - px).max(1);
+                let ph = ((size.1 * sy).round() as i32).min(shot.height() - py).max(1);
+                Monitor {
+                    pos,
+                    size,
+                    scale: (sx, sy),
+                    phys,
+                    sub: shot.new_subpixbuf(px, py, pw, ph),
+                }
+            })
+            .collect()
+    };
+
+    // 每屏各自缩放模型下的物理包围盒，与原图尺寸比对。
+    let mut right = f64::NEG_INFINITY;
+    let mut bottom = f64::NEG_INFINITY;
+    for &(pos, size, s) in &mons {
+        right = right.max((pos.0 - minx + size.0) * s);
+        bottom = bottom.max((pos.1 - miny + size.1) * s);
+    }
+    let tol_w = (iw * 0.02).max(4.0);
+    let tol_h = (ih * 0.02).max(4.0);
+
+    let monitors = if (right - iw).abs() <= tol_w && (bottom - ih).abs() <= tol_h {
+        build(true) // 每屏各自缩放（混合 DPI 拼接）
+    } else {
+        println!("[owlshot] 多屏物理拼接校验未通过，退回统一缩放 {ux:.2}×{uy:.2}");
+        build(false)
+    };
+
+    Layout {
+        bounds: Rect::new(minx, miny, maxx, maxy),
+        monitors,
+    }
+}
+
 struct State {
-    /// portal 抓到的全屏原图，物理像素分辨率。
+    /// portal 抓到的全屏原图（整个虚拟桌面合并成一张），物理像素分辨率。
     shot: Pixbuf,
-    /// 绘图区逻辑尺寸，每次绘制时刷新，用于逻辑坐标 → 物理像素换算（HiDPI 分数缩放同样适用）。
-    view: (f64, f64),
+    /// 多屏逻辑布局与各屏的原图切片。
+    layout: Layout,
+    /// 全局逻辑坐标下的选区（可跨屏）。
     rect: Option<Rect>,
     drag: Option<Drag>,
     hover: Option<Handle>,
@@ -218,47 +347,96 @@ impl State {
         self.preedit = (String::new(), 0);
     }
 
-    /// 绘制上下文：底图 + 当前缩放比。
-    fn canvas(&self) -> Canvas<'_> {
+    /// 绘制上下文：底图 + 第 `mi` 块屏的逻辑→物理映射。
+    fn canvas(&self, mi: usize) -> Canvas<'_> {
+        let m = &self.layout.monitors[mi];
         Canvas {
             shot: &self.shot,
-            scale: pixel_scale(self),
+            scale: m.scale,
+            origin: self.origin_of(mi),
         }
     }
 
-    /// 当前选区对应的工具栏布局；选区太小或不存在时没有工具栏。
+    /// 全局逻辑原点 (0,0) 在第 `mi` 块屏映射下的原图物理坐标：
+    /// `image_phys(p) = p * scale + origin`。
+    fn origin_of(&self, mi: usize) -> (f64, f64) {
+        let m = &self.layout.monitors[mi];
+        (m.phys.0 - m.pos.0 * m.scale.0, m.phys.1 - m.pos.1 * m.scale.1)
+    }
+
+    /// 当前选区对应的工具栏：返回（归属屏下标, 归属屏本地坐标的布局）。
     ///
+    /// 归属屏取选区右边缘中点所在屏（工具栏优先摆在选区右侧），
+    /// 右边缘在布局外时依次回退左边缘、选区中心、0 号屏。
     /// 每次都按当前选区重算而不缓存：布局是纯计算，且能天然跟随选区移动。
-    fn toolbar(&self) -> Option<Toolbar> {
+    fn toolbar(&self) -> Option<(usize, Toolbar)> {
         let rect = self.rect?;
         if rect.width() < MIN_SIZE || rect.height() < MIN_SIZE {
             return None;
         }
-        let (vw, vh) = self.view;
-        Some(Toolbar::layout(&rect, vw, vh, self.font_size_drop_open))
+        let cy = rect.top() + rect.height() / 2.0;
+        let cx = rect.left() + rect.width() / 2.0;
+        let mi = self
+            .layout
+            .monitor_at(rect.right() - 0.5, cy)
+            .or_else(|| self.layout.monitor_at(rect.left() + 0.5, cy))
+            .or_else(|| self.layout.monitor_at(cx, cy))
+            .unwrap_or(0);
+        let m = &self.layout.monitors[mi];
+        let local = Rect::new(
+            rect.left() - m.pos.0,
+            rect.top() - m.pos.1,
+            rect.right() - m.pos.0,
+            rect.bottom() - m.pos.1,
+        );
+        Some((
+            mi,
+            Toolbar::layout(&local, m.size.0, m.size.1, self.font_size_drop_open),
+        ))
     }
 }
 
 /// 结果只允许发送一次：确认与取消可能被多个回调触发（Esc / 关闭窗口 / 双击）。
+/// 多屏下一次确认/取消要关掉全部屏幕窗口。
 struct Outcome {
     tx: async_channel::Sender<Result<Option<Shot>, String>>,
     sent: RefCell<bool>,
+    windows: RefCell<Vec<Window>>,
+    closing: RefCell<bool>,
 }
 
 impl Outcome {
-    /// 回传结果并关窗。关窗动作**不受** `sent` 开关约束，
-    /// 否则一旦结果已发出（例如被 close-request 抢先），窗口就会永久留在屏幕上不再响应。
-    fn finish(&self, window: &Window, result: Result<Option<Shot>, String>) {
+    /// 回传结果并关闭全部屏幕窗口。
+    fn finish(&self, result: Result<Option<Shot>, String>) {
         self.send(result);
-        window.close();
+        // 关窗会再次触发各窗口的 close-request，closing 防止循环。
+        if self.closing.replace(true) {
+            return;
+        }
+        for w in self.windows.borrow().iter() {
+            w.close();
+        }
     }
 
-    /// 只回传结果、不碰窗口：供 close-request 回调使用，避免与 `close()` 互相递归。
+    /// 只回传结果、不碰窗口：供需要单独发送结果的场合使用。
     fn send(&self, result: Result<Option<Shot>, String>) {
         if self.sent.replace(true) {
             return;
         }
         let _ = self.tx.send_blocking(result);
+    }
+}
+
+/// 全部屏幕窗口的绘制句柄：任何状态变化都要重绘所有窗口，
+/// 否则跨屏选区/标注只会在鼠标所在那块屏上更新。
+#[derive(Clone)]
+struct Redraw(Rc<Vec<DrawingArea>>);
+
+impl Redraw {
+    fn now(&self) {
+        for area in self.0.iter() {
+            area.queue_draw();
+        }
     }
 }
 
@@ -269,9 +447,10 @@ fn build_window(
     let pixbuf = Pixbuf::from_file(shot)
         .with_context(|| format!("无法解码全屏截图 {}", shot.display()))?;
 
+    let layout = probe_layout(&pixbuf);
     let state = Rc::new(RefCell::new(State {
         shot: pixbuf,
-        view: (1.0, 1.0),
+        layout,
         rect: None,
         drag: None,
         hover: None,
@@ -291,126 +470,135 @@ fn build_window(
         font_size_drop_open: false,
     }));
 
-    let window = Window::new();
-    window.set_decorated(false);
-    window.set_title(Some("OwlShot 选区"));
-    // Wayland 下窗口无法自主定位，只能靠 fullscreen 覆盖；指定显示器避免多屏时落错屏。
-    match first_monitor() {
-        Some(monitor) => window.fullscreen_on_monitor(&monitor),
-        None => window.fullscreen(),
+    let display = gdk::Display::default();
+    let n = state.borrow().layout.monitors.len();
+
+    // 每块屏一个全屏无边框窗口：Wayland 单窗不能跨屏，跨屏选区靠
+    // 「各窗显示合并原图属于自己的切片 + 全局逻辑坐标」实现。
+    let mut wins: Vec<(Window, DrawingArea, IMMulticontext)> = Vec::with_capacity(n);
+    for i in 0..n {
+        let window = Window::new();
+        window.set_decorated(false);
+        window.set_title(Some("OwlShot 选区"));
+        let monitor = display
+            .as_ref()
+            .and_then(|d| d.monitors().item(i as u32))
+            .and_then(|obj| obj.downcast::<gdk::Monitor>().ok());
+        match monitor {
+            Some(m) => window.fullscreen_on_monitor(&m),
+            None => window.fullscreen(),
+        }
+
+        let area = DrawingArea::new();
+        // GTK4 里 can-focus 默认已是 true，真正允许控件成为焦点的是 focusable（DrawingArea 默认 false）。
+        area.set_focusable(true);
+        area.set_cursor(gdk::Cursor::from_name("crosshair", None).as_ref());
+        window.set_child(Some(&area));
+
+        // 每窗独立输入法上下文：只有持有焦点的窗口会收到键盘，其 IM 工作。
+        let im = IMMulticontext::new();
+        im.set_client_widget(Some(&area));
+
+        {
+            let state = state.clone();
+            area.set_draw_func(move |_, cr, w, h| {
+                let state = state.borrow();
+                draw(cr, &state, i, w as f64, h as f64);
+            });
+        }
+
+        wins.push((window, area, im));
     }
 
-    let area = DrawingArea::new();
-    // GTK4 里 can-focus 默认已是 true，真正允许控件成为焦点的是 focusable（DrawingArea 默认 false）。
-    area.set_focusable(true);
-    area.set_cursor(gdk::Cursor::from_name("crosshair", None).as_ref());
-    window.set_child(Some(&area));
-
-    // 输入法上下文：Wayland 下中文输入必须走 IMContext，
-    // 否则只能拿到 keyval（拼音键），既看不到预编辑串也拿不到汉字。
-    let im = IMMulticontext::new();
-    im.set_client_widget(Some(&area));
+    let redraw = Redraw(Rc::new(
+        wins.iter().map(|(_, area, _)| area.clone()).collect(),
+    ));
 
     let outcome = Rc::new(Outcome {
         tx,
         sent: RefCell::new(false),
+        windows: RefCell::new(wins.iter().map(|(w, _, _)| w.clone()).collect()),
+        closing: RefCell::new(false),
     });
 
-    {
-        let state = state.clone();
-        area.set_draw_func(move |_, cr, w, h| {
-            let mut state = state.borrow_mut();
-            state.view = (w as f64, h as f64);
-            draw(cr, &state);
-        });
+    for (i, (window, area, im)) in wins.iter().enumerate() {
+        let pos = state.borrow().layout.monitors[i].pos;
+        wire_drag(area, &state, im, pos, &redraw);
+        wire_motion(area, &state, pos);
+        wire_scroll(area, &state, &redraw);
+        wire_click(area, &state, window, &outcome, pos, &redraw);
+        wire_keys(&state, window, &outcome, im, pos, &redraw);
+        wire_im(&state, im, pos, &redraw);
     }
 
-    wire_drag(&area, &state, &im);
-    wire_motion(&area, &state);
-    wire_scroll(&area, &state);
-    wire_click(&area, &state, &window, &outcome);
-    wire_keys(&state, &window, &area, &outcome, &im);
-    wire_im(&area, &state, &im);
-
     {
-        // 窗口被外部关掉（如合成器强制关闭）时也要放行等待中的工作线程。
-        let outcome = outcome.clone();
-        window.connect_close_request(move |window| {
-            outcome.finish(window, Ok(None));
-            glib::Propagation::Proceed
-        });
+        // 窗口被外部关掉（如合成器强制关闭）时也要放行等待中的工作线程，并关掉其余屏的窗口。
+        for window in wins.iter().map(|(w, _, _)| w.clone()) {
+            let outcome = outcome.clone();
+            window.connect_close_request(move |_| {
+                outcome.finish(Ok(None));
+                glib::Propagation::Proceed
+            });
+        }
     }
 
-    window.present();
-    area.grab_focus();
+    for (window, _, _) in &wins {
+        window.present();
+    }
+    if let Some((_, area, _)) = wins.first() {
+        area.grab_focus();
+    }
     Ok(())
 }
 
-/// 默认显示器（首屏）；单屏场景即为唯一那块。
-fn first_monitor() -> Option<gdk::Monitor> {
-    let display = gdk::Display::default()?;
-    display
-        .monitors()
-        .item(0)
-        .and_then(|obj| obj.downcast::<gdk::Monitor>().ok())
-}
+fn draw(cr: &cairo::Context, state: &State, mi: usize, w: f64, h: f64) {
+    let m = &state.layout.monitors[mi];
 
-/// 逻辑坐标 → 原图物理像素的缩放比。
-/// 全屏窗口的逻辑尺寸与原图物理尺寸之比即为实际生效的缩放（含 HiDPI 分数缩放）。
-fn pixel_scale(state: &State) -> (f64, f64) {
-    let (vw, vh) = state.view;
-    if vw <= 0.0 || vh <= 0.0 {
-        return (1.0, 1.0);
-    }
-    (
-        state.shot.width() as f64 / vw,
-        state.shot.height() as f64 / vh,
-    )
-}
-
-fn draw(cr: &cairo::Context, state: &State) {
-    let (vw, vh) = state.view;
-    let (sx, sy) = pixel_scale(state);
-
-    // 底图：把物理像素原图按逻辑尺寸铺满，分数缩放下不会出现双倍分辨率错位。
+    // 底图切片：本屏在合并原图中的物理区域 1:1 贴到本屏逻辑坐标，
+    // 分数缩放不放大两倍，多屏也不会把整张桌面压缩进来。
     let _ = cr.save();
-    cr.scale(1.0 / sx, 1.0 / sy);
-    cr.set_source_pixbuf(&state.shot, 0.0, 0.0);
+    cr.translate(m.pos.0, m.pos.1);
+    cr.scale(1.0 / m.scale.0, 1.0 / m.scale.1);
+    cr.set_source_pixbuf(&m.sub, 0.0, 0.0);
     let _ = cr.paint();
     let _ = cr.restore();
 
-    // 全屏暗化。
+    // 本屏暗化。
     cr.set_source_rgba(0.0, 0.0, 0.0, MASK_ALPHA);
-    let _ = cr.paint();
+    cr.rectangle(0.0, 0.0, w, h);
+    let _ = cr.fill();
 
     let Some(rect) = state.rect else {
-        draw_hint(cr, vw, vh);
+        draw_hint(cr, w, h);
         return;
     };
 
-    let (l, t, w, h) = (rect.left(), rect.top(), rect.width(), rect.height());
-
-    // 选区内还原原始亮度。
+    // 切到全局逻辑坐标：选区/标注/手柄的坐标可以跨屏。
     let _ = cr.save();
-    cr.rectangle(l, t, w, h);
+    cr.translate(-m.pos.0, -m.pos.1);
+
+    // 选区内还原原始亮度；clip 自动裁出本屏可见的部分，跨屏选区两块屏各画各的。
+    let _ = cr.save();
+    cr.rectangle(rect.left(), rect.top(), rect.width(), rect.height());
     cr.clip();
-    cr.scale(1.0 / sx, 1.0 / sy);
-    cr.set_source_pixbuf(&state.shot, 0.0, 0.0);
+    cr.translate(m.pos.0, m.pos.1);
+    cr.scale(1.0 / m.scale.0, 1.0 / m.scale.1);
+    cr.set_source_pixbuf(&m.sub, 0.0, 0.0);
     let _ = cr.paint();
     let _ = cr.restore();
 
     // 标注一律裁剪在选区内绘制，与导出结果保持一致。
     let _ = cr.save();
-    cr.rectangle(l, t, w, h);
+    cr.rectangle(rect.left(), rect.top(), rect.width(), rect.height());
     cr.clip();
-    draw_shapes(cr, state);
+    draw_shapes(cr, state, mi);
     let _ = cr.restore();
 
-    // 1px 细边框，偏移半像素让描边落在整像素上。
+    // 1px 细边框，偏移半像素让描边落在整像素上；出屏部分由窗口自然裁掉。
     cr.set_antialias(cairo::Antialias::None);
     cr.set_line_width(1.0);
     cr.set_source_rgba(0.20, 0.60, 1.0, 0.95);
-    cr.rectangle(l + 0.5, t + 0.5, w - 1.0, h - 1.0);
+    cr.rectangle(rect.left() + 0.5, rect.top() + 0.5, rect.width() - 1.0, rect.height() - 1.0);
     let _ = cr.stroke();
     cr.set_antialias(cairo::Antialias::Default);
 
@@ -418,12 +606,26 @@ fn draw(cr: &cairo::Context, state: &State) {
     if !state.drawing() {
         draw_handles(cr, &rect, state.hover);
     }
-    draw_size_label(cr, &rect, vw, vh, sx, sy);
 
-    // 拖拽过程中隐藏工具栏，避免它跟着选区一起抖动。
+    // 实时尺寸标签只画在包含选区左上角的那块屏上，避免重复。
+    if state.layout.monitor_at(rect.left() + 0.5, rect.top() + 0.5) == Some(mi) {
+        let view = Rect::new(
+            m.pos.0,
+            m.pos.1,
+            m.pos.0 + m.size.0,
+            m.pos.1 + m.size.1,
+        );
+        draw_size_label(cr, &rect, &view, m.scale.0, m.scale.1);
+    }
+
+    // 拖拽过程中隐藏工具栏；工具栏只画在归属屏上（布局本身是归属屏本地坐标）。
     if state.drag.is_none()
-        && let Some(bar) = state.toolbar()
+        && let Some((owner, bar)) = state.toolbar()
+        && owner == mi
     {
+        let om = &state.layout.monitors[owner];
+        let _ = cr.save();
+        cr.translate(om.pos.0, om.pos.1);
         bar.draw(
             cr,
             state.tool,
@@ -433,12 +635,15 @@ fn draw(cr: &cairo::Context, state: &State) {
             !state.shapes.is_empty(),
             !state.redo.is_empty(),
         );
+        let _ = cr.restore();
     }
+
+    let _ = cr.restore(); // 回到本屏本地坐标
 }
 
-/// 已落定的标注 + 正在拖出的图元。
-fn draw_shapes(cr: &cairo::Context, state: &State) {
-    let canvas = state.canvas();
+/// 已落定的标注 + 正在拖出的图元；全部在全局逻辑坐标里，各屏窗口画各自可见的部分。
+fn draw_shapes(cr: &cairo::Context, state: &State, mi: usize) {
+    let canvas = state.canvas(mi);
     for shape in &state.shapes {
         shape.draw(cr, &canvas);
     }
@@ -493,8 +698,8 @@ fn draw_handles(cr: &cairo::Context, rect: &Rect, hover: Option<Handle>) {
     }
 }
 
-/// 实时尺寸提示，显示的是最终导出的物理像素数。
-fn draw_size_label(cr: &cairo::Context, rect: &Rect, vw: f64, vh: f64, sx: f64, sy: f64) {
+/// 实时尺寸提示，显示的是最终导出的物理像素数；`view` 是本屏的全局逻辑范围，用于夹住标签位置。
+fn draw_size_label(cr: &cairo::Context, rect: &Rect, view: &Rect, sx: f64, sy: f64) {
     let pw = (rect.width() * sx).round() as i64;
     let ph = (rect.height() * sy).round() as i64;
     if pw <= 0 || ph <= 0 {
@@ -513,20 +718,21 @@ fn draw_size_label(cr: &cairo::Context, rect: &Rect, vw: f64, vh: f64, sx: f64, 
     };
     let (bw, bh) = (ext.width() + 14.0, ext.height() + 10.0);
 
-    // 默认贴在选区左上角外侧，空间不足时翻到内侧，避免跑出屏幕。
+    // 默认贴在选区左上角外侧，空间不足时翻到内侧，避免跑出所在屏。
+    let (vl, vt, vr, vb) = (view.left(), view.top(), view.right(), view.bottom());
     let mut bx = rect.left();
     let mut by = rect.top() - bh - 6.0;
-    if by < 0.0 {
+    if by < vt {
         by = rect.top() + 6.0;
     }
-    if bx + bw > vw {
-        bx = vw - bw;
+    if bx + bw > vr {
+        bx = vr - bw;
     }
-    if by + bh > vh {
-        by = vh - bh;
+    if by + bh > vb {
+        by = vb - bh;
     }
-    bx = bx.max(0.0);
-    by = by.max(0.0);
+    bx = bx.max(vl);
+    by = by.max(vt);
 
     cr.set_source_rgba(0.0, 0.0, 0.0, 0.65);
     cr.rectangle(bx, by, bw, bh);
@@ -538,15 +744,23 @@ fn draw_size_label(cr: &cairo::Context, rect: &Rect, vw: f64, vh: f64, sx: f64, 
 }
 
 /// 左键拖拽：空白处拉新选区，选区内平移，手柄上调整边界。
-fn wire_drag(area: &DrawingArea, state: &Rc<RefCell<State>>, im: &IMMulticontext) {
+/// `pos` 是本窗所在屏在全局布局中的逻辑位置；鼠标本地坐标先换算成全局逻辑坐标再进状态。
+fn wire_drag(
+    area: &DrawingArea,
+    state: &Rc<RefCell<State>>,
+    im: &IMMulticontext,
+    pos: (f64, f64),
+    redraw: &Redraw,
+) {
     let gesture = GestureDrag::new();
     gesture.set_button(gdk::BUTTON_PRIMARY);
 
     {
         let state = state.clone();
-        let area = area.clone();
         let im = im.clone();
+        let redraw = redraw.clone();
         gesture.connect_drag_begin(move |_, x, y| {
+            let (gx, gy) = (x + pos.0, y + pos.1);
             // 正在输入文字时按下鼠标，视为确认当前拼音：必须在改动状态之前 reset，
             // 否则输入法回吐的未确认文本会落到下一段图元上。
             let was_editing = state.borrow().editing;
@@ -555,16 +769,23 @@ fn wire_drag(area: &DrawingArea, state: &Rc<RefCell<State>>, im: &IMMulticontext
             }
             // 输入法调用必须等借用释放后再做：commit / preedit 回调会重新借用 state。
             let mut opened_text = false;
+            // 工具栏上的按下交给点击手势处理：既不产生选区，也不落图元。
+            // 工具栏布局是归属屏本地坐标，鼠标要先减去归属屏原点。
+            let over_bar = {
+                let st = state.borrow();
+                st.toolbar().is_some_and(|(om, bar)| {
+                    let op = st.layout.monitors[om].pos;
+                    bar.contains(gx - op.0, gy - op.1)
+                })
+            };
+            if over_bar {
+                return;
+            }
             {
                 let mut state = state.borrow_mut();
-                // 工具栏上的按下交给点击手势处理：既不产生选区，也不落图元。
-                if state.toolbar().is_some_and(|bar| bar.contains(x, y)) {
-                    state.drag = None;
-                    return;
-                }
                 // 标注模式（选区已定 + 已选工具）优先，拖拽直接产出图元而非改选区。
                 if let (Some(tool), Some(rect)) = (state.tool, state.rect) {
-                    let (cx, cy) = rect.clamp_point(x, y);
+                    let (cx, cy) = rect.clamp_point(gx, gy);
                     let style = state.style;
                     if tool == Tool::Text {
                         // 文字不靠拖拽成形：先把上一段落定，再在落点开一段新输入。
@@ -578,13 +799,13 @@ fn wire_drag(area: &DrawingArea, state: &Rc<RefCell<State>>, im: &IMMulticontext
                     }
                 } else {
                     let existing = state.rect;
-                    state.drag = match (state.handle_at(x, y), existing) {
+                    state.drag = match (state.handle_at(gx, gy), existing) {
                         (Some(handle), Some(origin)) => Some(Drag::Resize { handle, origin }),
-                        (None, Some(origin)) if origin.contains(x, y) => {
+                        (None, Some(origin)) if origin.contains(gx, gy) => {
                             Some(Drag::Move { origin })
                         }
                         _ => {
-                            state.rect = Some(Rect::new(x, y, x, y));
+                            state.rect = Some(Rect::new(gx, gy, gx, gy));
                             Some(Drag::Create)
                         }
                     };
@@ -594,32 +815,35 @@ fn wire_drag(area: &DrawingArea, state: &Rc<RefCell<State>>, im: &IMMulticontext
                 // 丢掉上一段残留的未确认拼音，再让输入法为新的一段开始工作。
                 im.reset();
                 im.focus_in();
-                sync_cursor_location(&state, &im);
+                sync_cursor_location(&state, &im, pos);
             }
-            area.queue_draw();
+            redraw.now();
         });
     }
 
     {
         let state = state.clone();
+        let redraw = redraw.clone();
         let area = area.clone();
         gesture.connect_drag_update(move |gesture, dx, dy| {
             let Some((sx, sy)) = gesture.start_point() else {
                 return;
             };
             let mut state = state.borrow_mut();
-            apply_drag(&mut state, sx, sy, dx, dy);
+            apply_drag(&mut state, sx + pos.0, sy + pos.1, dx, dy);
+            drop(state);
             area.queue_draw();
+            redraw.now();
         });
     }
 
     {
         let state = state.clone();
-        let area = area.clone();
+        let redraw = redraw.clone();
         gesture.connect_drag_end(move |gesture, dx, dy| {
             let mut state = state.borrow_mut();
             if let Some((sx, sy)) = gesture.start_point() {
-                apply_drag(&mut state, sx, sy, dx, dy);
+                apply_drag(&mut state, sx + pos.0, sy + pos.1, dx, dy);
             }
             let was_draw = matches!(state.drag, Some(Drag::Draw));
             state.drag = None;
@@ -633,33 +857,35 @@ fn wire_drag(area: &DrawingArea, state: &Rc<RefCell<State>>, im: &IMMulticontext
                 state.rect = None;
             }
             state.hover = None;
-            area.queue_draw();
+            drop(state);
+            redraw.now();
         });
     }
 
     area.add_controller(gesture);
 }
 
-/// 把一次拖拽位移落到选区上；`(sx, sy)` 是按下点，`(dx, dy)` 是相对位移。
+/// 把一次拖拽位移落到选区上；`(sx, sy)` 是按下点（全局逻辑坐标），`(dx, dy)` 是相对位移。
 fn apply_drag(state: &mut State, sx: f64, sy: f64, dx: f64, dy: f64) {
-    let (vw, vh) = state.view;
+    let b = state.layout.bounds;
+    let (bl, bt, br, bb) = (b.left(), b.top(), b.right(), b.bottom());
     match state.drag {
         Some(Drag::Create) => {
             state.rect = Some(Rect::new(
-                sx.clamp(0.0, vw),
-                sy.clamp(0.0, vh),
-                (sx + dx).clamp(0.0, vw),
-                (sy + dy).clamp(0.0, vh),
+                sx.clamp(bl, br),
+                sy.clamp(bt, bb),
+                (sx + dx).clamp(bl, br),
+                (sy + dy).clamp(bt, bb),
             ));
         }
         Some(Drag::Move { origin }) => {
-            // 平移不改变尺寸，因此位移量要先被屏幕边界夹住。
-            let dx = dx.clamp(-origin.left(), vw - origin.right());
-            let dy = dy.clamp(-origin.top(), vh - origin.bottom());
+            // 平移不改变尺寸，因此位移量要先被布局边界夹住。
+            let dx = dx.clamp(bl - origin.left(), br - origin.right());
+            let dy = dy.clamp(bt - origin.top(), bb - origin.bottom());
             state.rect = Some(origin.offset(dx, dy));
         }
         Some(Drag::Resize { handle, origin }) => {
-            state.rect = Some(resize(&origin, handle, dx, dy, vw, vh));
+            state.rect = Some(resize(&origin, handle, dx, dy, bl, bt, br, bb));
         }
         Some(Drag::Draw) => {
             // 图元被夹在选区内，导出裁剪后不会出现半截标注。
@@ -674,7 +900,16 @@ fn apply_drag(state: &mut State, sx: f64, sy: f64, dx: f64, dy: f64) {
 }
 
 /// 按手柄方向调整边界；用绝对边（left/top/right/bottom）避免反向拖拽时坐标错乱。
-fn resize(origin: &Rect, handle: Handle, dx: f64, dy: f64, vw: f64, vh: f64) -> Rect {
+fn resize(
+    origin: &Rect,
+    handle: Handle,
+    dx: f64,
+    dy: f64,
+    bl: f64,
+    bt: f64,
+    br: f64,
+    bb: f64,
+) -> Rect {
     let (mut l, mut t, mut r, mut b) =
         (origin.left(), origin.top(), origin.right(), origin.bottom());
 
@@ -702,26 +937,35 @@ fn resize(origin: &Rect, handle: Handle, dx: f64, dy: f64, vw: f64, vh: f64) -> 
     }
 
     Rect::new(
-        l.clamp(0.0, vw),
-        t.clamp(0.0, vh),
-        r.clamp(0.0, vw),
-        b.clamp(0.0, vh),
+        l.clamp(bl, br),
+        t.clamp(bt, bb),
+        r.clamp(bl, br),
+        b.clamp(bt, bb),
     )
 }
 
-/// 悬停反馈：手柄高亮 + 光标形状切换。
-fn wire_motion(area: &DrawingArea, state: &Rc<RefCell<State>>) {
+/// 悬停反馈：手柄高亮 + 光标形状切换。`pos` 为本屏在全局布局中的逻辑位置。
+fn wire_motion(area: &DrawingArea, state: &Rc<RefCell<State>>, pos: (f64, f64)) {
     let motion = EventControllerMotion::new();
     let state = state.clone();
     let area_ref = area.clone();
     motion.connect_motion(move |_, x, y| {
+        let (gx, gy) = (x + pos.0, y + pos.1);
         let mut state = state.borrow_mut();
         if state.drag.is_some() {
             return;
         }
         // 工具栏区域：只更新按钮悬停态，不做画布命中，光标恢复默认。
-        if let Some(bar) = state.toolbar().filter(|bar| bar.contains(x, y)) {
-            let hit = bar.hit(x, y);
+        // 工具栏布局是归属屏本地坐标，鼠标全局坐标先减归属屏原点。
+        let bar_hit = {
+            let st = &*state;
+            st.toolbar().and_then(|(om, bar)| {
+                let op = st.layout.monitors[om].pos;
+                let (lx, ly) = (gx - op.0, gy - op.1);
+                bar.contains(lx, ly).then(|| bar.hit(lx, ly))
+            })
+        };
+        if let Some(hit) = bar_hit {
             if state.bar_hover != hit {
                 state.bar_hover = hit;
                 area_ref.queue_draw();
@@ -742,8 +986,8 @@ fn wire_motion(area: &DrawingArea, state: &Rc<RefCell<State>>) {
             area_ref.set_cursor(gdk::Cursor::from_name("crosshair", None).as_ref());
             return;
         }
-        let hover = state.handle_at(x, y);
-        let inside = state.rect.map(|r| r.contains(x, y)).unwrap_or(false);
+        let hover = state.handle_at(gx, gy);
+        let inside = state.rect.map(|r| r.contains(gx, gy)).unwrap_or(false);
         let name = match (hover, inside) {
             (Some(handle), _) => handle.cursor(),
             (None, true) => "move",
@@ -759,10 +1003,10 @@ fn wire_motion(area: &DrawingArea, state: &Rc<RefCell<State>>) {
 }
 
 /// 滚轮调线宽：字号 / 马赛克块 / 模糊强度 / 序号圆都由线宽派生，一个通道调全部工具。
-fn wire_scroll(area: &DrawingArea, state: &Rc<RefCell<State>>) {
+fn wire_scroll(area: &DrawingArea, state: &Rc<RefCell<State>>, redraw: &Redraw) {
     let scroll = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
     let state = state.clone();
-    let area_ref = area.clone();
+    let redraw = redraw.clone();
     scroll.connect_scroll(move |_, _, dy| {
         let mut st = state.borrow_mut();
         // 向上滚（dy < 0）加粗，向下滚变细。
@@ -772,18 +1016,20 @@ fn wire_scroll(area: &DrawingArea, state: &Rc<RefCell<State>>) {
         }
         st.style.stroke = next;
         drop(st);
-        area_ref.queue_draw();
+        redraw.now();
         glib::Propagation::Stop
     });
     area.add_controller(scroll);
 }
 
-/// 左键双击确认，右键取消。
+/// 左键双击确认，右键取消。`pos` 为本屏全局逻辑位置，鼠标坐标先换算成全局再判定。
 fn wire_click(
     area: &DrawingArea,
     state: &Rc<RefCell<State>>,
     window: &Window,
     outcome: &Rc<Outcome>,
+    pos: (f64, f64),
+    redraw: &Redraw,
 ) {
     let confirm = GestureClick::new();
     confirm.set_button(gdk::BUTTON_PRIMARY);
@@ -791,13 +1037,16 @@ fn wire_click(
         let state = state.clone();
         let window = window.clone();
         let outcome = outcome.clone();
+        let redraw = redraw.clone();
         confirm.connect_pressed(move |_, n_press, x, y| {
+            let (gx, gy) = (x + pos.0, y + pos.1);
             let bar_hit = {
                 let state = state.borrow();
-                state
-                    .toolbar()
-                    .filter(|bar| bar.contains(x, y))
-                    .map(|bar| bar.hit(x, y))
+                state.toolbar().and_then(|(om, bar)| {
+                    let op = state.layout.monitors[om].pos;
+                    let (lx, ly) = (gx - op.0, gy - op.1);
+                    bar.contains(lx, ly).then(|| bar.hit(lx, ly))
+                })
             };
             // 工具栏吞掉落在其上的所有点击；只有首次按下才触发按钮，双击不重复执行。
             if let Some(hit) = bar_hit {
@@ -808,24 +1057,24 @@ fn wire_click(
                     if !matches!(item, Item::FontSizeDrop | Item::FontSizePick(_)) {
                         state.borrow_mut().font_size_drop_open = false;
                     }
-                    activate_item(&state, &window, &outcome, item);
+                    activate_item(&state, &window, &outcome, item, &redraw);
                 }
                 return;
             }
             // 点击工具栏外时关闭字号下拉框。
             if n_press == 1 && state.borrow().font_size_drop_open {
                 state.borrow_mut().font_size_drop_open = false;
-                window.queue_draw();
+                redraw.now();
             }
             if n_press < 2 {
                 return;
             }
             let inside = {
                 let state = state.borrow();
-                state.rect.map(|r| r.contains(x, y)).unwrap_or(false)
+                state.rect.map(|r| r.contains(gx, gy)).unwrap_or(false)
             };
             if inside {
-                confirm_selection(&state, &window, &outcome);
+                confirm_selection(&state, &outcome);
             }
         });
     }
@@ -834,19 +1083,19 @@ fn wire_click(
     let cancel = GestureClick::new();
     cancel.set_button(gdk::BUTTON_SECONDARY);
     {
-        let window = window.clone();
         let outcome = outcome.clone();
-        cancel.connect_pressed(move |_, _, _, _| outcome.finish(&window, Ok(None)));
+        cancel.connect_pressed(move |_, _, _, _| outcome.finish(Ok(None)));
     }
     area.add_controller(cancel);
 }
 
-/// 执行一个工具栏按钮的动作。
+/// 执行一个工具栏按钮的动作。`window` 仅作颜色选择器的父窗口。
 fn activate_item(
     state: &Rc<RefCell<State>>,
     window: &Window,
     outcome: &Rc<Outcome>,
     item: Item,
+    redraw: &Redraw,
 ) {
     match item {
         Item::Tool(tool) => {
@@ -856,7 +1105,7 @@ fn activate_item(
             st.commit_active();
             st.font_size_drop_open = false;
             drop(st);
-            window.queue_draw();
+            redraw.now();
         }
         Item::Color(i) => {
             let mut st = state.borrow_mut();
@@ -866,24 +1115,24 @@ fn activate_item(
                 shape.set_color(PALETTE[i]);
             }
             drop(st);
-            window.queue_draw();
+            redraw.now();
         }
         Item::FontSizeDrop => {
             let mut st = state.borrow_mut();
             st.font_size_drop_open = !st.font_size_drop_open;
             drop(st);
-            window.queue_draw();
+            redraw.now();
         }
         Item::FontSizePick(i) => {
             let mut st = state.borrow_mut();
             st.style.font_size = FONT_SIZES[i];
             st.font_size_drop_open = false;
             drop(st);
-            window.queue_draw();
+            redraw.now();
         }
         Item::ColorPicker => {
             let state = state.clone();
-            let window = window.clone();
+            let redraw = redraw.clone();
             let dialog = ColorDialog::new();
             let current = {
                 let st = state.borrow();
@@ -891,7 +1140,7 @@ fn activate_item(
                 gdk::RGBA::new(c.r as f32, c.g as f32, c.b as f32, 1.0)
             };
             dialog.choose_rgba(
-                Some(&window),
+                Some(window),
                 Some(&current),
                 None::<&gtk4::gio::Cancellable>,
                 move |result| {
@@ -906,23 +1155,25 @@ fn activate_item(
                         if let Some(shape) = st.active.as_mut() {
                             shape.set_color(color);
                         }
+                        drop(st);
+                        redraw.now();
                     }
                 },
             );
         }
         Item::Undo => {
             if state.borrow_mut().undo() {
-                window.queue_draw();
+                redraw.now();
             }
         }
         Item::Redo => {
             if state.borrow_mut().redo() {
-                window.queue_draw();
+                redraw.now();
             }
         }
-        Item::Copy => copy_selection(state, window, outcome),
-        Item::Save => confirm_selection(state, window, outcome),
-        Item::Cancel => outcome.finish(window, Ok(None)),
+        Item::Copy => copy_selection(state, outcome),
+        Item::Save => confirm_selection(state, outcome),
+        Item::Cancel => outcome.finish(Ok(None)),
     }
 }
 
@@ -930,18 +1181,19 @@ fn activate_item(
 ///
 /// 控制器挂在 Window 而非 DrawingArea：键盘事件由 toplevel 向下分发，
 /// 挂窗口层 + Capture 阶段可确保无论焦点落在哪个子控件（甚至没有焦点控件）都能收到按键。
+/// 多屏下只有持有焦点的窗口会收到键盘，状态变化统一经 `redraw` 广播到所有屏。
 fn wire_keys(
     state: &Rc<RefCell<State>>,
     window: &Window,
-    area: &DrawingArea,
     outcome: &Rc<Outcome>,
     im: &IMMulticontext,
+    pos: (f64, f64),
+    redraw: &Redraw,
 ) {
     let keys = EventControllerKey::new();
     let state = state.clone();
     let outcome = outcome.clone();
-    let win = window.clone();
-    let area_ref = area.clone();
+    let redraw = redraw.clone();
     let im_ctx = im.clone();
     keys.connect_key_pressed(move |ctrl, key, _, modifier| {
         // 借用先落到局部变量：`if state.borrow().x && f()` 里的临时 Ref 会活到整个条件求值结束，
@@ -954,10 +1206,10 @@ fn wire_keys(
             if let Some(event) = ctrl.current_event()
                 && im_ctx.filter_keypress(&event)
             {
-                area_ref.queue_draw();
+                redraw.now();
                 return glib::Propagation::Stop;
             }
-            if handle_text_key(&state, &win, &im_ctx, key, modifier) {
+            if handle_text_key(&state, &im_ctx, key, modifier, pos, &redraw) {
                 return glib::Propagation::Stop;
             }
         }
@@ -967,7 +1219,7 @@ fn wire_keys(
             && matches!(key, gdk::Key::z | gdk::Key::Z)
         {
             if state.borrow_mut().redo() {
-                area_ref.queue_draw();
+                redraw.now();
             }
             return glib::Propagation::Stop;
         }
@@ -976,7 +1228,7 @@ fn wire_keys(
             && matches!(key, gdk::Key::z | gdk::Key::Z)
         {
             if state.borrow_mut().undo() {
-                area_ref.queue_draw();
+                redraw.now();
             }
             return glib::Propagation::Stop;
         }
@@ -984,7 +1236,7 @@ fn wire_keys(
         if modifier.contains(gdk::ModifierType::CONTROL_MASK)
             && matches!(key, gdk::Key::c | gdk::Key::C)
         {
-            copy_selection(&state, &win, &outcome);
+            copy_selection(&state, &outcome);
             return glib::Propagation::Stop;
         }
         // 工具键只在已有选区时生效，否则无处落笔；带 Ctrl/Alt 的组合键不当工具键。
@@ -1000,7 +1252,7 @@ fn wire_keys(
             st.commit_active();
             st.font_size_drop_open = false;
             drop(st);
-            area_ref.queue_draw();
+            redraw.now();
             return glib::Propagation::Stop;
         }
         match key {
@@ -1008,7 +1260,7 @@ fn wire_keys(
                 // 先关闭字号下拉框。
                 if state.borrow().font_size_drop_open {
                     state.borrow_mut().font_size_drop_open = false;
-                    area_ref.queue_draw();
+                    redraw.now();
                     return glib::Propagation::Stop;
                 }
                 // 先退出标注工具，已在选区模式才整体取消。
@@ -1019,13 +1271,13 @@ fn wire_keys(
                     had
                 };
                 if exited {
-                    area_ref.queue_draw();
+                    redraw.now();
                 } else {
-                    outcome.finish(&win, Ok(None));
+                    outcome.finish(Ok(None));
                 }
             }
             gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::space => {
-                confirm_selection(&state, &win, &outcome);
+                confirm_selection(&state, &outcome);
             }
             // 其余按键放行给 GTK（未来的快捷键在此之前拦截）。
             _ => return glib::Propagation::Proceed,
@@ -1042,10 +1294,11 @@ fn wire_keys(
 /// 退格、换行、结束输入，以及无输入法时的直接键入字符（英文、数字、标点）。
 fn handle_text_key(
     state: &Rc<RefCell<State>>,
-    window: &Window,
     im: &IMMulticontext,
     key: gdk::Key,
     modifier: gdk::ModifierType,
+    pos: (f64, f64),
+    redraw: &Redraw,
 ) -> bool {
     let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
     let alt = modifier.contains(gdk::ModifierType::ALT_MASK);
@@ -1091,9 +1344,9 @@ fn handle_text_key(
         im.reset();
         im.focus_out();
     } else {
-        sync_cursor_location(state, im);
+        sync_cursor_location(state, im, pos);
     }
-    window.queue_draw();
+    redraw.now();
     true
 }
 
@@ -1101,10 +1354,16 @@ fn handle_text_key(
 ///
 /// Wayland 下候选窗由 ibus 自己弹出并按 `set_cursor_location` 定位，
 /// 但预编辑（尚未上屏的拼音）必须客户端自己画，否则用户看不到自己敲了什么。
-fn wire_im(area: &DrawingArea, state: &Rc<RefCell<State>>, im: &IMMulticontext) {
+/// `pos` 为本屏全局逻辑位置：状态里的坐标是全局的，IM 需要的是本窗本地坐标。
+fn wire_im(
+    state: &Rc<RefCell<State>>,
+    im: &IMMulticontext,
+    pos: (f64, f64),
+    redraw: &Redraw,
+) {
     {
         let state = state.clone();
-        let area = area.clone();
+        let redraw = redraw.clone();
         im.connect_commit(move |_, text| {
             {
                 let mut st = state.borrow_mut();
@@ -1116,47 +1375,48 @@ fn wire_im(area: &DrawingArea, state: &Rc<RefCell<State>>, im: &IMMulticontext) 
                     }
                 }
             }
-            area.queue_draw();
+            redraw.now();
         });
     }
 
     {
         let state = state.clone();
-        let area = area.clone();
+        let redraw = redraw.clone();
         im.connect_preedit_start(move |_| {
             state.borrow_mut().preedit = (String::new(), 0);
-            area.queue_draw();
+            redraw.now();
         });
     }
 
     {
         let state = state.clone();
-        let area = area.clone();
+        let redraw = redraw.clone();
         let im_ctx = im.clone();
         im.connect_preedit_changed(move |_| {
             // 只取文本与光标偏移；属性（下划线/高亮）由 draw_preedit 统一样式，不逐段还原。
             let (text, _attrs, cursor) = im_ctx.preedit_string();
             state.borrow_mut().preedit = (text.to_string(), cursor);
-            sync_cursor_location(&state, &im_ctx);
-            area.queue_draw();
+            sync_cursor_location(&state, &im_ctx, pos);
+            redraw.now();
         });
     }
 
     {
         let state = state.clone();
-        let area = area.clone();
+        let redraw = redraw.clone();
         im.connect_preedit_end(move |_| {
             state.borrow_mut().preedit = (String::new(), 0);
-            area.queue_draw();
+            redraw.now();
         });
     }
 }
 
 /// 告知输入法当前文字光标的位置，让候选窗贴着光标弹出而不是飘到屏幕角落。
 ///
-/// 坐标是相对 client widget（DrawingArea）的逻辑像素，与图元坐标系一致。
-/// 调用方必须确保此时没有持有 `state` 的借用：`set_cursor_location` 可能同步回调进来。
-fn sync_cursor_location(state: &Rc<RefCell<State>>, im: &IMMulticontext) {
+/// 状态里是全局逻辑坐标，`set_cursor_location` 要的是相对 client widget（DrawingArea）
+/// 的本地坐标，因此减去本屏原点。调用方必须确保此时没有持有 `state` 的借用：
+/// `set_cursor_location` 可能同步回调进来。
+fn sync_cursor_location(state: &Rc<RefCell<State>>, im: &IMMulticontext, pos: (f64, f64)) {
     let metrics = {
         let st = state.borrow();
         st.active.as_ref().and_then(text_caret_metrics)
@@ -1165,8 +1425,8 @@ fn sync_cursor_location(state: &Rc<RefCell<State>>, im: &IMMulticontext) {
         return;
     };
     im.set_cursor_location(&gdk::Rectangle::new(
-        x as i32,
-        top as i32,
+        (x - pos.0) as i32,
+        (top - pos.1) as i32,
         1,
         h.max(1.0) as i32,
     ));
@@ -1192,7 +1452,7 @@ fn tool_for_key(key: gdk::Key) -> Option<Tool> {
 }
 
 /// 裁剪并落盘。没有有效选区时按整屏确认，避免按键「毫无反应」的观感。
-fn confirm_selection(state: &Rc<RefCell<State>>, window: &Window, outcome: &Rc<Outcome>) {
+fn confirm_selection(state: &Rc<RefCell<State>>, outcome: &Rc<Outcome>) {
     // 未落定的图元（尤其正在敲的文字）也要一起导出。
     state.borrow_mut().commit_active();
     let result = {
@@ -1203,11 +1463,11 @@ fn confirm_selection(state: &Rc<RefCell<State>>, window: &Window, outcome: &Rc<O
             .map(|path| Some(Shot::Saved(path)))
             .map_err(|err| format!("{err:#}"))
     };
-    outcome.finish(window, result);
+    outcome.finish(result);
 }
 
 /// Ctrl+C：裁剪当前选区直接写剪贴板并关窗，不在图片目录留文件。
-fn copy_selection(state: &Rc<RefCell<State>>, window: &Window, outcome: &Rc<Outcome>) {
+fn copy_selection(state: &Rc<RefCell<State>>, outcome: &Rc<Outcome>) {
     state.borrow_mut().commit_active();
     let result = {
         let state = state.borrow();
@@ -1217,7 +1477,7 @@ fn copy_selection(state: &Rc<RefCell<State>>, window: &Window, outcome: &Rc<Outc
             .map(|backend| Some(Shot::Copied(backend)))
             .map_err(|err| format!("{err:#}"))
     };
-    outcome.finish(window, result);
+    outcome.finish(result);
 }
 
 /// 两条剪贴板后端都以文件为输入，故先写一份临时 PNG。
@@ -1239,25 +1499,34 @@ fn copy_pixbuf(pixbuf: Pixbuf) -> Result<Backend> {
     backend
 }
 
-/// 待导出的逻辑选区；无有效选区时退化为整屏。
+/// 待导出的全局逻辑选区；无有效选区时退化为整个布局（全部屏）。
 fn export_rect(state: &State) -> Rect {
     match state.rect {
         Some(rect) if rect.width() >= MIN_SIZE && rect.height() >= MIN_SIZE => rect,
         _ => {
-            let (vw, vh) = state.view;
             println!("[owlshot] 无选区，按整屏导出。");
-            Rect::new(0.0, 0.0, vw, vh)
+            state.layout.bounds
         }
     }
 }
 
-/// 逻辑选区换算成物理像素后裁剪，保证 HiDPI 下导出的是原始清晰度。
+/// 导出用的映射帧：选区左上角所在屏的缩放与全局原点物理坐标。
+/// 统一 DPI 下各屏一致；混合 DPI 跨屏选区按起点屏折算（已知近似，见 README）。
+fn export_frame(state: &State, rect: &Rect) -> ((f64, f64), (f64, f64)) {
+    let mi = state
+        .layout
+        .monitor_at(rect.left() + 0.5, rect.top() + 0.5)
+        .unwrap_or(0);
+    (state.layout.monitors[mi].scale, state.origin_of(mi))
+}
+
+/// 全局逻辑选区换算成原图物理像素后裁剪，保证 HiDPI 下导出的是原始清晰度。
 fn crop(state: &State, rect: &Rect) -> Result<Pixbuf> {
-    let (sx, sy) = pixel_scale(state);
+    let ((sx, sy), (ox, oy)) = export_frame(state, rect);
     let (iw, ih) = (state.shot.width(), state.shot.height());
 
-    let x = (rect.left() * sx).round().clamp(0.0, iw as f64) as i32;
-    let y = (rect.top() * sy).round().clamp(0.0, ih as f64) as i32;
+    let x = (rect.left() * sx + ox).round().clamp(0.0, iw as f64) as i32;
+    let y = (rect.top() * sy + oy).round().clamp(0.0, ih as f64) as i32;
     let w = ((rect.width() * sx).round() as i32).min(iw - x).max(1);
     let h = ((rect.height() * sy).round() as i32).min(ih - y).max(1);
 
@@ -1265,16 +1534,26 @@ fn crop(state: &State, rect: &Rect) -> Result<Pixbuf> {
     if state.shapes.is_empty() {
         Ok(state.shot.new_subpixbuf(x, y, w, h))
     } else {
-        compose(state, x, y, w, h)
+        compose(state, x, y, w, h, sx, sy, ox, oy)
     }
 }
 
 /// 把选区底图与标注合成成一张物理分辨率的图。
 ///
-/// 标注存的是逻辑坐标，这里把用户坐标系按 `pixel_scale` 变换回逻辑坐标，
+/// 标注存的是全局逻辑坐标，这里按导出帧的缩放换算回物理坐标，
 /// 于是预览与导出共用同一套 `Shape::draw`，HiDPI 下也不会错位。
-fn compose(state: &State, x: i32, y: i32, w: i32, h: i32) -> Result<Pixbuf> {
-    let (sx, sy) = pixel_scale(state);
+#[allow(clippy::too_many_arguments)]
+fn compose(
+    state: &State,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    sx: f64,
+    sy: f64,
+    ox: f64,
+    oy: f64,
+) -> Result<Pixbuf> {
     // 底图不透明，用 Rgb24 可省掉预乘 alpha 的换算。
     let surface = cairo::ImageSurface::create(cairo::Format::Rgb24, w, h)
         .context("创建导出画布失败")?;
@@ -1286,9 +1565,12 @@ fn compose(state: &State, x: i32, y: i32, w: i32, h: i32) -> Result<Pixbuf> {
 
         cr.translate(-(x as f64), -(y as f64));
         cr.scale(sx, sy);
+        // 补上全局逻辑原点在原图中的物理偏移：物理 = p * scale + origin。
+        cr.translate(ox / sx, oy / sy);
         let canvas = Canvas {
             shot: &state.shot,
             scale: (sx, sy),
+            origin: (ox, oy),
         };
         for shape in &state.shapes {
             shape.draw(&cr, &canvas);

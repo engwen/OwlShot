@@ -231,13 +231,16 @@ pub enum Shape {
     },
 }
 
-/// 绘制时需要的外部上下文：底图与「逻辑坐标 → 物理像素」缩放比。
+/// 绘制时需要的外部上下文：底图与「全局逻辑坐标 → 原图物理像素」映射。
 ///
-/// 马赛克必须回读底图，因此绘制不能只依赖 Cairo 上下文；预览与导出共用同一入口，
-/// 差异仅在于传入的 `scale`（预览是窗口逻辑尺寸比，导出为 1:1 物理像素）。
+/// 马赛克必须回读底图，因此绘制不能只依赖 Cairo 上下文；预览与导出共用同一入口。
+/// 多屏下坐标是跨屏的全局逻辑坐标，映射为 `image_phys = p * scale + origin`：
+/// `scale` 是所在屏生效的 HiDPI 比例，`origin` 是全局逻辑原点在原图中的物理坐标
+/// （多屏布局原点可能是负数，不一定在图内）。
 pub struct Canvas<'a> {
     pub shot: &'a Pixbuf,
     pub scale: (f64, f64),
+    pub origin: (f64, f64),
 }
 
 impl Shape {
@@ -554,10 +557,12 @@ fn draw_counter(cr: &cairo::Context, pos: (f64, f64), index: u32, color: &Color,
 /// `up` 决定观感：`Nearest` 得到硬边方块（马赛克），`Bilinear` 得到平滑过渡（模糊）。
 fn pixelate(cr: &cairo::Context, rect: &Rect, block: f64, canvas: &Canvas, up: InterpType) {
     let (sx, sy) = canvas.scale;
+    let (ox, oy) = canvas.origin;
     let (iw, ih) = (canvas.shot.width(), canvas.shot.height());
 
-    let px = (rect.left() * sx).floor().clamp(0.0, iw as f64) as i32;
-    let py = (rect.top() * sy).floor().clamp(0.0, ih as f64) as i32;
+    // 全局逻辑坐标 → 原图物理坐标：p * scale + origin。
+    let px = ((rect.left() * sx + ox).floor()).clamp(0.0, iw as f64) as i32;
+    let py = ((rect.top() * sy + oy).floor()).clamp(0.0, ih as f64) as i32;
     let pw = ((rect.width() * sx).ceil() as i32).min(iw - px);
     let ph = ((rect.height() * sy).ceil() as i32).min(ih - py);
     if pw < 1 || ph < 1 {
@@ -580,8 +585,9 @@ fn pixelate(cr: &cairo::Context, rect: &Rect, block: f64, canvas: &Canvas, up: I
     let _ = cr.save();
     cr.rectangle(rect.left(), rect.top(), rect.width(), rect.height());
     cr.clip();
+    // 贴图位置的物理坐标换算回全局逻辑坐标：p = (phys - origin) / scale。
     cr.scale(1.0 / sx, 1.0 / sy);
-    cr.set_source_pixbuf(&big, px as f64, py as f64);
+    cr.set_source_pixbuf(&big, (px as f64 - ox) / sx, (py as f64 - oy) / sy);
     let _ = cr.paint();
     let _ = cr.restore();
 }
