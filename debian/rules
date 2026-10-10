@@ -1,6 +1,6 @@
 #!/usr/bin/make -f
 PREFIX := debian/owlshot
-DEB_PKG := owlshot_0.1.3-1_amd64.deb
+DEB_PKG := owlshot_0.1.4_amd64.deb
 
 .PHONY: build install package clean
 
@@ -19,6 +19,7 @@ install: build
 	cp debian/control $(PREFIX)/DEBIAN/control
 	test ! -f debian/postinst || install -m 755 debian/postinst $(PREFIX)/DEBIAN/postinst
 	test ! -f debian/prerm || install -m 755 debian/prerm $(PREFIX)/DEBIAN/prerm
+	test ! -f debian/postrm || install -m 755 debian/postrm $(PREFIX)/DEBIAN/postrm
 
 package: install
 	dpkg-deb --build --root-owner-group $(PREFIX) $(DEB_PKG)

@@ -38,10 +38,12 @@ pub struct ShortcutsConfig {
 impl Default for ShortcutsConfig {
     fn default() -> Self {
         Self {
+            // 默认只开启「框选截图」一个内置快捷键 Ctrl+Alt+A；全屏/贴图留空（不注册），
+            // 用户想用再去配置文件里取消对应行的注释并填触发器。
             enabled: true,
-            region: "CTRL+SHIFT+a".to_string(),
-            fullscreen: "CTRL+SHIFT+s".to_string(),
-            paste: "CTRL+SHIFT+v".to_string(),
+            region: "CTRL+ALT+a".to_string(),
+            fullscreen: String::new(),
+            paste: String::new(),
         }
     }
 }
@@ -179,22 +181,33 @@ impl CaptureConfig {
     }
 }
 
-const TEMPLATE: &str = r#"# OwlShot 配置文件
-# 修改后重启 owlshot 生效。
+const TEMPLATE: &str = r##"# OwlShot 配置文件
+# 改完本文件后，必须重启 owlshot 才会生效：
+#   1) 托盘图标 → 退出（或在终端里结束正在运行的 owlshot 进程）；
+#   2) 重新运行 owlshot（或重新登录桌面让自启动拉起）。
+# 配置只在进程启动时读取一次，运行期间改动不会被热加载。
 
 [shortcuts]
 # 是否向 xdg-desktop-portal 注册全局快捷键（会弹系统授权窗口）。
+# Ubuntu 26.04 LTS 已内置此快捷键：owlshot 默认注册 Ctrl+Alt+A（框选截图），
+#       26.04 的 portal 后端已实现 GlobalShortcuts 接口，装好即用、无需手动配置。
 # 注意：GNOME 46 及更早版本的 portal 后端尚未实现 GlobalShortcuts 接口，
 #       此时请改用「GNOME 设置 → 键盘 → 自定义快捷键」绑定命令：
 #           owlshot --region     （框选截图）
 #           owlshot --full       （全屏截图）
+#           owlshot --paste      （贴图）
 enabled = true
 # 触发器语法：修饰键 CTRL / ALT / SHIFT / NUM / LOGO 与键名以 + 连接，
 # 键名取自 xkbcommon keysym（如 a、Print、space、Return）。
-region = "CTRL+SHIFT+a"
-fullscreen = "CTRL+SHIFT+s"
-# 贴图（Ctrl+Shift+V）：把剪贴板里的图片贴到屏幕上，用于数据对比。
-paste = "CTRL+SHIFT+v"
+#
+# 默认只开启「框选截图」一个快捷键（Ctrl+Alt+A）。下面 fullscreen / paste 两行默认被注释掉，
+# 不会注册、也不会占用任何系统按键。想启用时：
+#   1) 去掉对应行开头的 "# "；
+#   2) 按需修改等号右侧的触发器（可自定义成任意组合，避免和系统已占用的键冲突）；
+#   3) 保存后按文件顶部说明重启 owlshot 生效。
+region = "CTRL+ALT+a"
+# fullscreen = "CTRL+ALT+s"
+# paste = "CTRL+SHIFT+v"
 
 [capture]
 # 保存目录，留空 = XDG 图片目录下的 Screenshots，可写 "~/Pictures/shots"。
@@ -215,4 +228,4 @@ keep = 3
 [advanced]
 # GNOME 私有 Mutter D-Bus 增强（阶段4），默认关闭；KDE/Sway 下强制忽略。
 use_mutter_overlay = false
-"#;
+"##;

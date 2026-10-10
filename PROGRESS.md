@@ -263,6 +263,22 @@
 - 版本统一升 0.1.2：Cargo.toml / debian/control / debian/rules / debian/changelog
 - README 新增「Ubuntu 24.04 / 26.04 双版本兼容」章节（构建规则、依赖依据、GlobalShortcuts 差异）
 
+## 内置快捷键默认精简（0.1.4）：只保留 region，其余交给用户
+
+- **背景**：旧版默认把 `region=CTRL+SHIFT+a` / `fullscreen=CTRL+SHIFT+s` /
+  `paste=CTRL+SHIFT+v` 三个全部注册，在 26.04（portal 支持 GlobalShortcuts）
+  上会抢占系统按键，用户无法在系统设置里改。
+- **改动**：
+  - `src/config.rs` `ShortcutsConfig::default()`：`enabled=true` 保留，
+    只有 `region="CTRL+SHIFT+a"`，`fullscreen` / `paste` 置空字符串（空触发器 =
+    不指定首选键，`shortcuts.rs::new_shortcut` 对空值跳过 preferred_trigger）。
+  - 配置模板 TEMPLATE：`region` 保留生效；`fullscreen` / `paste` 两行默认用 `# ` 注释掉，
+    并补充「如何去注释启用、如何自定义触发器、改完必须重启 owlshot 生效（配置仅启动时读一次）」说明。
+  - README 配置章节同步：表格里 fullscreen/paste 标注「默认注释」，新增
+    「启用、修改快捷键与重启生效」小节。
+- **注意**：旧配置文件已落盘的用户不受新默认影响（`load()` 不覆盖已存在文件），
+  需手动编辑 `~/.config/owlshot/config.toml` 或删除后重新生成。
+
 ## 多屏跨屏截图（0.1.3-1）：解决「多屏扩展被压缩到一块屏」
 
 - **根因**：portal 的 `Screenshot` 返回的是**整个虚拟桌面合并成的一张大图**（各屏物理

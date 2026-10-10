@@ -556,8 +556,10 @@ fn draw(cr: &cairo::Context, state: &State, mi: usize, w: f64, h: f64) {
 
     // 底图切片：本屏在合并原图中的物理区域 1:1 贴到本屏逻辑坐标，
     // 分数缩放不放大两倍，多屏也不会把整张桌面压缩进来。
+    // DrawingArea 本地坐标每窗都从 (0,0) 起（各窗覆盖各自那块屏），
+    // 因此底图直接贴在本地 (0,0)，绝不能再加 m.pos 偏移——否则副屏
+    // （pos 非零）会把底图推到可见区域外，整屏变白。
     let _ = cr.save();
-    cr.translate(m.pos.0, m.pos.1);
     cr.scale(1.0 / m.scale.0, 1.0 / m.scale.1);
     cr.set_source_pixbuf(&m.sub, 0.0, 0.0);
     let _ = cr.paint();

@@ -1,6 +1,6 @@
 [package]
 name = "owlshot"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 # edition 2024 的最低 rustc；24.04 自带 apt rustc 1.75 装不动，必须走 rustup
 rust-version = "1.85"

@@ -1,3 +1,13 @@
+owlshot (0.1.4) unstable; urgency=low
+
+  * 内置全局快捷键默认只注册「框选截图」（Ctrl+Shift+A）一个，
+    全屏（fullscreen）与贴图（paste）两项在配置模板中默认注释掉，
+    不再占用系统按键；用户可在 ~/.config/owlshot/config.toml 里
+    取消注释并自定义触发器，改完重启 owlshot 生效。
+  * 配置模板补充快捷键启用/修改与重启生效的详细说明。
+
+ -- engwen <engwen@localhost>  Fri, 10 Oct 2026 00:00:00 +0800
+
 owlshot (0.1.3-1) unstable; urgency=low
 
   * 多屏扩展模式支持跨显示器截图：portal 返回的全桌面合并大图不再被

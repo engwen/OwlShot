@@ -107,8 +107,11 @@ GNOME 46 及更早版本的 portal 后端**尚未实现 GlobalShortcuts 接口**
 2. 拉到底部，进入「自定义快捷键」，点 `+`
 3. 填写：
    - 名称：`OwlShot 框选截图`
-   - 命令：`/home/<你的用户名>/.local/bin/owlshot --region`（**必须写绝对路径**，见下方说明）
+   - 命令：`/usr/bin/owlshot --region`（deb 安装；源码装到 `~/.local/bin` 则写该绝对路径，**必须写绝对路径**，见下方说明）
    - 快捷键：按下你想用的组合，例如 `Ctrl+Alt+A`
+
+> **Ubuntu 26.04 LTS 已内置此快捷键**：owlshot 默认通过 portal 的 GlobalShortcuts 注册了 `Ctrl+Alt+A`（框选截图），26.04 的 portal 后端已实现该接口，装好即用，**无需再手动配置**。只有想改键位、或在 GNOME 46 及更早（portal 尚未实现 GlobalShortcuts）的环境里，才需要按本节用 GNOME 自定义快捷键手动绑定。
+
 4. 按同样方式绑定其余命令：
 
 | 建议按键 | 命令 | 作用 |
@@ -136,9 +139,12 @@ GNOME 46 及更早版本的 portal 后端**尚未实现 GlobalShortcuts 接口**
 [shortcuts]
 # 是否向 xdg-desktop-portal 注册全局快捷键（会弹系统授权窗口）
 enabled = true
-# 触发器语法见下表
+# 触发器语法见下表。默认只开启「框选截图」一个；
+# fullscreen / paste 默认被注释掉，不注册也不占系统按键，
+# 需要时去掉行首 "# " 并自定义触发器，改完重启 owlshot 生效。
 region = "CTRL+SHIFT+a"
-fullscreen = "CTRL+SHIFT+s"
+# fullscreen = "CTRL+SHIFT+s"
+# paste = "CTRL+SHIFT+v"
 
 [capture]
 # 保存目录，留空 = XDG 图片目录下的 Screenshots，可写 "~/Pictures/shots"
@@ -159,13 +165,22 @@ use_mutter_overlay = false
 | --- | --- | --- |
 | `shortcuts.enabled` | `true` | 设为 `false` 则完全跳过 portal 快捷键注册（只用托盘 + CLI） |
 | `shortcuts.region` | `CTRL+SHIFT+a` | 框选截图触发器，留空表示不指定首选键、交由系统分配 |
-| `shortcuts.fullscreen` | `CTRL+SHIFT+s` | 全屏截图触发器 |
+| `shortcuts.fullscreen` | （注释掉） | 全屏截图触发器；模板中默认注释，取消注释即生效 |
+| `shortcuts.paste` | （注释掉） | 贴图触发器；模板中默认注释，取消注释即生效 |
 | `capture.save_dir` | `""` | 留空 = `XDG_PICTURES_DIR/Screenshots`；支持 `~` 与 `~/xxx` |
 | `capture.file_prefix` | `owlshot` | 空值回落 `owlshot` |
 | `capture.copy_to_clipboard` | `true` | `false` 时保存后不写剪贴板；不影响编辑器里显式按下的 `Ctrl+C` |
 | `advanced.use_mutter_overlay` | `false` | 见下节「GNOME 私有增强」 |
 
 触发器语法（XDG Shortcuts 规范）：修饰键 `CTRL` / `ALT` / `SHIFT` / `NUM` / `LOGO` 与键名用 `+` 连接，键名取 xkbcommon keysym 去掉 `XKB_KEY_` 前缀，例如 `CTRL+SHIFT+a`、`LOGO+Print`、`ALT+space`。
+
+### 启用、修改快捷键与重启生效
+
+内置快捷键默认只开启「框选截图」`CTRL+SHIFT+a` 一个，`fullscreen` 与 `paste` 两行在模板里以 `# ` 开头被注释掉，既不向 portal 注册、也不会占用系统按键。要启用或改键：
+
+1. 打开 `~/.config/owlshot/config.toml`，在 `[shortcuts]` 段落里去掉对应行开头的 `# `；
+2. 把等号右侧改成你想要的触发器（避免与系统已占用的键冲突）；
+3. 保存后**重启 owlshot**才会生效——配置只在进程启动时读取一次，运行期间改动不会热加载。重启方式：托盘图标 → 退出（或在终端结束 owlshot 进程），再重新运行 `owlshot`（或重新登录桌面让自启动拉起）。
 
 ## 编辑器操作
 
