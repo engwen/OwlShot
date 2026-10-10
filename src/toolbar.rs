@@ -258,22 +258,38 @@ impl Toolbar {
                     cr.set_source_rgba(1.0, 1.0, 1.0, 0.14);
                     let _ = cr.fill();
                 }
-                // 字号数值。
-                let label = format!("{} ▾", font_size as i32);
+                // 字号数值（纯数字，箭头另用矢量绘制，避免字体缺字形渲染成方块）。
+                let label = format!("{}", font_size as i32);
                 cr.select_font_face(
                     "sans-serif",
                     cairo::FontSlant::Normal,
                     cairo::FontWeight::Normal,
                 );
                 cr.set_font_size(11.0);
+                // 数值整体略向左偏移，给右侧三角箭头让出位置。
+                let arrow_w = 7.0;
+                let arrow_gap = 4.0;
                 if let Ok(ext) = cr.text_extents(&label) {
                     cr.new_path();
+                    let text_x = r.left()
+                        + (r.width() - ext.width() - arrow_w - arrow_gap) / 2.0
+                        - ext.x_bearing();
                     cr.move_to(
-                        r.left() + (r.width() - ext.width()) / 2.0 - ext.x_bearing(),
+                        text_x,
                         r.top() + (r.height() - ext.height()) / 2.0 - ext.y_bearing(),
                     );
                     cr.set_source_rgba(1.0, 1.0, 1.0, 0.92);
                     let _ = cr.show_text(&label);
+                    // 在数值右侧画一个实心下三角作为下拉指示。
+                    let ax = text_x + ext.width() + arrow_gap;
+                    let ay = r.top() + r.height() / 2.0;
+                    cr.new_path();
+                    cr.move_to(ax, ay - 2.0);
+                    cr.line_to(ax + arrow_w, ay - 2.0);
+                    cr.line_to(ax + arrow_w / 2.0, ay + 3.0);
+                    cr.close_path();
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.92);
+                    let _ = cr.fill();
                 }
                 continue;
             }
